@@ -1,0 +1,9 @@
+numpy>=1.24.0,<2.0
+stable-ts[fw]
+demucs
+pysubs2>=1.6.0
+
+pykakasi>=2.2.1
+pypinyin>=0.49.0
+arabic-reshaper>=3.0.0
+python-bidi>=0.4.2 
