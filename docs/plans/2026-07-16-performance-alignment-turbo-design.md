@@ -45,9 +45,9 @@ Move ML imports into the transcription path so subtitle-only operations do not i
 
 Use ffmpeg to extract 16 kHz mono PCM instead of 44.1 kHz stereo PCM. Continue selecting the requested MKV stream. Write to a temporary WAV and rename it only after ffmpeg exits successfully.
 
-### Faster-Whisper batching
+### Accuracy-first Faster-Whisper inference
 
-Use Stable-ts's Faster-Whisper integration for all ordinary transcription, including voice-separated transcription. On CUDA, begin with a conservative batch size selected from total VRAM. If inference reports an out-of-memory failure, retry with progressively smaller batches before falling back to CPU. Explicitly requested models remain unchanged during fallback.
+Use Stable-ts's Faster-Whisper integration for all ordinary transcription, including voice-separated transcription. Keep inference sequential: passing a batch size selects Faster-Whisper's VAD-driven batched pipeline, which can skip valid dialogue and is unsuitable for subtitle completeness. If CUDA inference fails, retry on CPU. Explicitly requested models remain unchanged during fallback.
 
 ### Voice separation
 
@@ -83,7 +83,7 @@ Add `turbo` to the advertised Whisper model names while preserving every existin
 
 Automatic model selection remains backward compatible in this iteration; Turbo is explicitly available through `--whisper-model turbo`. Benchmarks can justify a later default change.
 
-GPU failure retries the same resolved model and options on CPU. Model, backend, compute type, batch size policy, voice separation, and relevant inference settings are included in the cache manifest.
+GPU failure retries the same resolved model and options on CPU. Model, backend, compute type, inference mode, voice separation, and relevant inference settings are included in the cache manifest.
 
 No Qwen or other ASR backend is introduced.
 
@@ -103,7 +103,7 @@ No Qwen or other ASR backend is introduced.
 - Representative output retains all source text and valid timestamps.
 - Merge-only imports do not require the ML stack.
 - A changed model or preprocessing option invalidates transcription but not unrelated extraction artifacts.
-- GPU batching improves representative transcription throughput without reducing timestamp or transcription quality.
+- Sequential inference retains dialogue coverage on representative subtitle workloads.
 - Merge runtime grows approximately linearly on synthetic long subtitle tracks.
 
 ## Out of scope

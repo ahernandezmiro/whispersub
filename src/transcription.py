@@ -12,7 +12,7 @@ from .cache import (
 )
 from .config import TranscriptionConfig
 from .model_registry import validate_model_name
-from .utils import get_gpu_memory_gb, get_optimal_device_and_model, write_file
+from .utils import get_optimal_device_and_model, write_file
 
 
 def _package_version(distribution):
@@ -20,19 +20,6 @@ def _package_version(distribution):
         return metadata.version(distribution)
     except metadata.PackageNotFoundError:
         return "unknown"
-
-
-def _batch_sizes(device):
-    if device != "cuda":
-        return [None]
-    memory = get_gpu_memory_gb()
-    if memory >= 16:
-        return [16, 8, 4, 2, 1]
-    if memory >= 10:
-        return [8, 4, 2, 1]
-    if memory >= 6:
-        return [4, 2, 1]
-    return [2, 1]
 
 
 def _is_cuda_failure(error):
@@ -76,7 +63,6 @@ def transcribe_with_whisper(
     device, auto_model_name = get_optimal_device_and_model(force_cpu=force_cpu)
     resolved_model = validate_model_name(model_name or auto_model_name)
     compute_type = "float16" if device == "cuda" else "int8"
-    batch_sizes = _batch_sizes(device)
     result_json_path = result_json_path or _result_json_path(recognized_srt_path)
 
     config = TranscriptionConfig(
@@ -88,9 +74,9 @@ def transcribe_with_whisper(
     cache_config = config.as_cache_dict()
     cache_config.update({
         "backend": "faster-whisper",
-        "stable_ts_version": _package_version("stable-ts"),
+        "stable_ts_version": _package_version("stable-ts-whisperless"),
         "faster_whisper_version": _package_version("faster-whisper"),
-        "batch_policy": batch_sizes,
+        "inference_mode": "sequential",
         "max_words": 15,
         "voice_separation_model": "htdemucs" if voice_separation else None,
     })
@@ -152,28 +138,8 @@ def transcribe_with_whisper(
             device=device,
         )
 
-        result = None
-        last_error = None
-        for batch_size in batch_sizes:
-            attempt_args = dict(transcribe_args)
-            if batch_size is not None:
-                attempt_args["batch_size"] = batch_size
-                print(f"[INFO] Running batched transcription with batch size {batch_size}...")
-            else:
-                print("[INFO] Running transcription with language detection...")
-            try:
-                result = model.transcribe(**attempt_args)
-                break
-            except Exception as error:
-                last_error = error
-                if device == "cuda" and _is_cuda_failure(error) and batch_size != batch_sizes[-1]:
-                    print(f"[WARNING] Batch size {batch_size} failed; retrying with a smaller batch.")
-                    _clear_cuda_cache()
-                    continue
-                raise
-
-        if result is None:
-            raise last_error or RuntimeError("Transcription produced no result")
+        print("[INFO] Running sequential transcription with language detection...")
+        result = model.transcribe(**transcribe_args)
 
         result.split_by_length(max_words=15)
         _render_result(result, result_json_path, recognized_srt_path)
@@ -187,6 +153,7 @@ def transcribe_with_whisper(
         print(f"[ERROR] Transcription failed on {device}: {error}")
         if device == "cuda" and _is_cuda_failure(error):
             print("[INFO] Hardware acceleration failed, falling back to CPU...")
+            _clear_cuda_cache()
             return transcribe_with_whisper(
                 audio_path,
                 recognized_srt_path,

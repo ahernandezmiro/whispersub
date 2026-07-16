@@ -59,7 +59,7 @@ def get_optimal_device_and_model(force_cpu=False):
         device = "cuda"
         gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
         if gpu_memory >= 8:
-            model_name = "large-v2"
+            model_name = "large-v3"
         elif gpu_memory >= 6:
             model_name = "medium"
         else:

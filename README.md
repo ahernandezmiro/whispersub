@@ -7,7 +7,7 @@ WhisperSub is a command-line tool for extracting, transcribing, aligning, and me
 ## Features
 
 * **Efficient Audio Extraction**: Extracts 16 kHz mono PCM audio with ffmpeg, matching Whisper's input format without oversized stereo intermediates.
-* **Automatic Transcription**: Uses stable-ts with Faster-Whisper, automatic language detection, adaptive CUDA batching, and word-level timestamps.
+* **Automatic Transcription**: Uses stable-ts with Faster-Whisper, automatic language detection, accuracy-first sequential inference, and word-level timestamps.
 * **Flexible Whisper Models**: Includes `turbo` alongside the existing Whisper variants and accepts compatible Faster-Whisper model identifiers or local paths.
 * **Advanced Audio Processing**: Optionally creates and caches a Demucs vocal stem before transcription.
 * **Subtitle Extraction**: Extracts existing subtitle tracks from MKV files.
@@ -63,6 +63,8 @@ pip install -r requirements.txt
 pip install -r requirements-gpu.txt
 pip install -r requirements.txt
 ```
+
+WhisperSub installs the official `stable-ts-whisperless` distribution and Faster-Whisper explicitly. The application does not use the vanilla `openai-whisper` backend, so it is intentionally excluded from the dependency set.
 
 If you face issues with PyTorch or CUDA DLLs, consider switching to the Conda installation below.
 
@@ -145,7 +147,7 @@ python whispersub.py --i examples\deutsch.mkv --merge --base-subs examples\deuts
 
 ## Processing and Cache Behavior
 
-WhisperSub extracts 16 kHz mono PCM audio, matching the speech-recognition input format while keeping temporary files small. CUDA transcription uses adaptive Faster-Whisper batching and retries with progressively smaller batches if GPU memory is insufficient. If CUDA inference fails, the same resolved model is retried on CPU rather than silently switching models.
+WhisperSub extracts 16 kHz mono PCM audio, matching the speech-recognition input format while keeping temporary files small. Transcription uses Faster-Whisper's sequential pipeline on both CUDA and CPU. Batched inference is intentionally disabled because its VAD-driven pipeline can omit speech in subtitle-focused workloads. If CUDA inference fails, the same resolved model is retried on CPU rather than silently switching models.
 
 Cached artifacts are stored in a path-hashed, source-specific directory under `.tmp`. Audio, vocal stems, extracted subtitles, and transcription results have manifests containing source metadata and the settings that produced them. Changing the source file, track, model, voice-separation setting, backend version, or related processing options invalidates only the affected artifact. Outputs are written atomically, and transcription is cached as stable-ts JSON so subtitle rendering and alignment can be repeated without running speech recognition again.
 

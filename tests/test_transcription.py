@@ -6,6 +6,7 @@ import types
 import unittest
 from unittest.mock import patch
 
+from src.cache import build_manifest, read_manifest, write_manifest
 from src.transcription import transcribe_with_whisper
 
 
@@ -48,18 +49,44 @@ class TranscriptionTests(unittest.TestCase):
             os.path.join(directory, "result.json"),
         )
 
-    def test_gpu_batch_retries_with_smaller_batch(self):
+    def test_gpu_transcription_does_not_enable_lossy_batched_pipeline(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = self._paths(directory)
-            model = _FakeModel(RuntimeError("CUDA out of memory"))
+            model = _FakeModel()
             stable = types.SimpleNamespace(load_faster_whisper=lambda *args, **kwargs: model)
             with patch.dict(sys.modules, {"stable_whisper": stable}), \
-                 patch("src.transcription.get_optimal_device_and_model", return_value=("cuda", "large-v2")), \
-                 patch("src.transcription._batch_sizes", return_value=[4, 2]), \
-                 patch("src.transcription._clear_cuda_cache"), \
+                 patch("src.transcription.get_optimal_device_and_model", return_value=("cuda", "large-v3")), \
                  patch("src.transcription._package_version", return_value="test"):
-                transcribe_with_whisper(*paths[:3], model_name="turbo", result_json_path=paths[3])
-            self.assertEqual([call["batch_size"] for call in model.calls], [4, 2])
+                transcribe_with_whisper(*paths[:3], result_json_path=paths[3])
+
+            self.assertNotIn("batch_size", model.calls[0])
+
+    def test_batched_transcription_cache_is_invalidated(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self._paths(directory)
+            with open(paths[3], "w", encoding="utf-8") as handle:
+                json.dump({"language": "en", "segments": []}, handle)
+            write_manifest(
+                paths[3],
+                build_manifest(
+                    "transcription",
+                    paths[0],
+                    {"inference_mode": "batched", "batch_policy": [8, 4, 2, 1]},
+                ),
+            )
+            model = _FakeModel()
+            stable = types.SimpleNamespace(load_faster_whisper=lambda *args, **kwargs: model)
+
+            with patch.dict(sys.modules, {"stable_whisper": stable}), \
+                 patch("src.transcription.get_optimal_device_and_model", return_value=("cpu", "medium")), \
+                 patch("src.transcription._package_version", return_value="test"):
+                transcribe_with_whisper(*paths[:3], result_json_path=paths[3])
+
+            self.assertEqual(len(model.calls), 1)
+            self.assertEqual(
+                read_manifest(paths[3])["config"]["inference_mode"],
+                "sequential",
+            )
 
     def test_structured_result_cache_skips_inference(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -77,7 +104,6 @@ class TranscriptionTests(unittest.TestCase):
             )
             with patch.dict(sys.modules, {"stable_whisper": stable}), \
                  patch("src.transcription.get_optimal_device_and_model", return_value=("cpu", "medium")), \
-                 patch("src.transcription._batch_sizes", return_value=[None]), \
                  patch("src.transcription._package_version", return_value="test"):
                 transcribe_with_whisper(*paths[:3], model_name="turbo", result_json_path=paths[3])
                 transcribe_with_whisper(*paths[:3], model_name="turbo", result_json_path=paths[3])
@@ -97,7 +123,6 @@ class TranscriptionTests(unittest.TestCase):
             stable = types.SimpleNamespace(load_faster_whisper=load)
             with patch.dict(sys.modules, {"stable_whisper": stable}), \
                  patch("src.transcription.get_optimal_device_and_model", side_effect=[("cuda", "large-v2"), ("cpu", "medium")]), \
-                 patch("src.transcription._batch_sizes", side_effect=[[1], [None]]), \
                  patch("src.transcription._clear_cuda_cache"), \
                  patch("src.transcription._package_version", return_value="test"):
                 transcribe_with_whisper(*paths[:3], model_name="turbo", result_json_path=paths[3])
@@ -112,7 +137,6 @@ class TranscriptionTests(unittest.TestCase):
 
             with patch.dict(sys.modules, {"stable_whisper": stable}), \
                  patch("src.transcription.get_optimal_device_and_model", return_value=("cuda", "large-v2")), \
-                 patch("src.transcription._batch_sizes", return_value=[2]), \
                  patch("src.transcription._package_version", return_value="test"), \
                  patch("src.transcription.separate_vocals", return_value=vocals) as separate:
                 transcribe_with_whisper(

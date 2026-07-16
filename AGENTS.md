@@ -8,7 +8,7 @@ WhisperSub is a Python CLI that extracts MKV audio and subtitle tracks, transcri
 
 - `whispersub.py` parses CLI arguments and orchestrates processing.
 - `src/audio.py` owns ffmpeg extraction and optional Demucs vocal separation.
-- `src/transcription.py` owns stable-ts/Faster-Whisper loading, batching, fallback, and structured transcription results.
+- `src/transcription.py` owns stable-ts/Faster-Whisper loading, sequential inference, fallback, and structured transcription results.
 - `src/alignment.py` contains pure timing, candidate-discovery, monotonic matching, and snapping logic.
 - `src/subtitles.py` owns subtitle parsing, normalization, styling, romanization integration, and output rendering.
 - `src/cache.py` owns artifact manifests and atomic output helpers.
@@ -26,6 +26,7 @@ WhisperSub is a Python CLI that extracts MKV audio and subtitle tracks, transcri
 - Preserve source signs, titles, and positioned overlays, but do not normally use them as dialogue alignment anchors.
 - Maintain monotonic alignment and positive cue duration. Low-confidence timing should remain unsnapped.
 - Preserve an explicitly selected Whisper model when retrying on CPU.
+- Do not pass `batch_size` to Stable-ts transcription. It selects Faster-Whisper's VAD-driven batched pipeline, which can omit speech in this workload.
 
 ## Dependencies and commands
 

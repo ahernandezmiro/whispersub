@@ -13,6 +13,10 @@ from src.alignment import (
 
 
 class AlignmentTests(unittest.TestCase):
+    def test_empty_base_track_has_no_matches(self):
+        secondary = [AlignmentEvent(0, 1000, 0, text="spoken text")]
+        self.assertEqual(align_events([], secondary), {})
+
     def test_titles_and_positioned_events_are_not_dialogue_anchors(self):
         title = AlignmentEvent(0, 1000, 0, text="Episode", style="Show_Title")
         positioned = AlignmentEvent(0, 1000, 1, text="Sign", positioned=True)

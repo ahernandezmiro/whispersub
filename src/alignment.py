@@ -216,6 +216,9 @@ class _PrefixMaximum:
 
 def select_monotonic_matches(base_events, secondary_events, candidates, transform):
     """Select a maximum-scoring monotonic chain, then expand contiguous overlaps."""
+    if not base_events or not secondary_events or not candidates:
+        return {}
+
     by_secondary = {}
     for candidate in candidates:
         by_secondary.setdefault(candidate.secondary, []).append(candidate)
@@ -262,6 +265,9 @@ def select_monotonic_matches(base_events, secondary_events, candidates, transfor
 
 
 def align_events(base_events, secondary_events, tolerance=200):
+    if not base_events or not secondary_events:
+        return {}
+
     proposed = estimate_time_transform(base_events, secondary_events)
     identity = TimeTransform()
     identity_candidates = discover_candidates(

@@ -10,6 +10,31 @@ from src.subtitles import extract_subtitles, merge_subtitles
 
 
 class SubtitleIntegrationTests(unittest.TestCase):
+    def test_transcription_only_word_level_render_needs_no_base_track(self):
+        with tempfile.TemporaryDirectory() as directory:
+            transcription_path = os.path.join(directory, "transcription.srt")
+            output_path = os.path.join(directory, "transcription.ass")
+            transcription = pysubs2.SSAFile()
+            transcription.append(
+                pysubs2.SSAEvent(start=100, end=900, text="spoken text")
+            )
+            transcription.save(transcription_path)
+
+            merge_subtitles(
+                base_subs_path=None,
+                second_subs_path=None,
+                transcribed_subs_path=transcription_path,
+                output_subs_path=output_path,
+                detected_language="en",
+                highlight_current_word=True,
+            )
+
+            rendered = pysubs2.load(output_path)
+            self.assertEqual(
+                [event.text for event in rendered if event.layer == 2],
+                ["spoken text"],
+            )
+
     def test_subtitle_extraction_uses_a_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             source = os.path.join(directory, "video.mkv")
