@@ -2,15 +2,17 @@
 
 ## Overview
 
-WhisperSub is a command-line tool for automating the extraction, transcription, and merging of subtitles for MKV video files. It leverages state-of-the-art speech recognition ([stable-ts](https://github.com/jianfch/stable-ts)) and subtitle handling libraries to streamline the process of generating and synchronizing subtitles, including comprehensive support for romanization across multiple languages.
+WhisperSub is a command-line tool for extracting, transcribing, aligning, and merging subtitles for MKV video files. It uses [stable-ts](https://github.com/jianfch/stable-ts) with the Faster-Whisper backend for timestamped speech recognition and supports romanization across multiple languages.
 
 ## Features
 
-* **Audio Extraction**: Extracts audio tracks from MKV files using ffmpeg.
-* **Automatic Transcription**: Uses Stable Whisper (stable-ts) to transcribe speech to text with improved accuracy, automatic language detection, and word-level timestamps.
-* **Advanced Audio Processing**: Integrates with Demucs for speech isolation and noise reduction.
+* **Efficient Audio Extraction**: Extracts 16 kHz mono PCM audio with ffmpeg, matching Whisper's input format without oversized stereo intermediates.
+* **Automatic Transcription**: Uses stable-ts with Faster-Whisper, automatic language detection, adaptive CUDA batching, and word-level timestamps.
+* **Flexible Whisper Models**: Includes `turbo` alongside the existing Whisper variants and accepts compatible Faster-Whisper model identifiers or local paths.
+* **Advanced Audio Processing**: Optionally creates and caches a Demucs vocal stem before transcription.
 * **Subtitle Extraction**: Extracts existing subtitle tracks from MKV files.
-* **Subtitle Merging**: Merges base subtitles (e.g., translations) with recognized (transcribed) subtitles, supporting multi-language and romanized output.
+* **Accurate Subtitle Merging**: Uses dialogue-aware, monotonic alignment with offset/drift correction and many-to-many cue matching.
+* **Configuration-aware Caching**: Reuses complete artifacts only when the source and relevant processing settings still match.
 * **Comprehensive Romanization Support**: Automatically converts transcribed text to Latin characters for 8+ languages with optimized performance.
 * **Flexible Input/Output**: Supports specifying audio/subtitle tracks or external subtitle files.
 * **Sync Tolerance**: Adjustable timing tolerance for subtitle alignment.
@@ -92,11 +94,11 @@ python whispersub.py --i <input.mkv> [--o <output.ass>] [--transcribe] [--merge]
 ### Transcription Options
 
 * `--audio-track` : Index of the audio track to extract (default: 1)
-* `--whisper-model` : Stable Whisper model to use: tiny, base, small, medium, large, large-v2, large-v3. If not specified, the model is automatically selected based on your system's capabilities and available memory. Larger models provide better accuracy but require more memory and processing time.
+* `--whisper-model` : Whisper model name or compatible Faster-Whisper model path. Built-ins are tiny, base, small, medium, large, large-v2, large-v3, and turbo. If not specified, the model is automatically selected based on your system's capabilities and available memory. Turbo offers substantially faster transcription with a small accuracy tradeoff.
 * `--force-cpu` : Force CPU usage for transcription even if CUDA is available. Useful for debugging or when GPU memory is limited
 * `--romanize` : Enable romanization for supported languages
 * `--word-level` : Enable word-level timestamps in transcription
-* `--voice-separation` : Enable voice separation (Demucs) during transcription. Slows transcription while improving results
+* `--voice-separation` : Preprocess audio through Demucs and cache a 16 kHz mono vocal stem. This can improve recognition in noisy material but adds processing time
 
 ### Merging Options
 
@@ -104,7 +106,7 @@ python whispersub.py --i <input.mkv> [--o <output.ass>] [--transcribe] [--merge]
 * `--base-subs` : Path to existing base subtitle file (alternative to --subtitle-track)
 * `--merge-track` : Index of the second subtitle track (required for merge-only mode)
 * `--merge-subs` : Path to existing secondary subtitle file (required for merge-only mode, alternative to --merge-track)
-* `--sync-tolerance` : Sync tolerance in milliseconds for merging subtitle(default=200)
+* `--sync-tolerance` : Sync tolerance in milliseconds for merging subtitles (default=200)
 * `--disable-layers` : Disable smart subtitle layering mode. By default, the application will try to position subtitles intelligently to avoid overlap while maintaining readability. When disabled, subtitles will be rendered in a single layer which may result in wrong order of the text but prevents the overlapping subtitle lines.
 
 ### Examples
@@ -140,6 +142,14 @@ Merge two existing subtitle tracks without transcription:
 ```bash
 python whispersub.py --i examples\deutsch.mkv --merge --base-subs examples\deutsch_transcribed.ass --merge-subs examples\deutsch_translated.ass
 ```
+
+## Processing and Cache Behavior
+
+WhisperSub extracts 16 kHz mono PCM audio, matching the speech-recognition input format while keeping temporary files small. CUDA transcription uses adaptive Faster-Whisper batching and retries with progressively smaller batches if GPU memory is insufficient. If CUDA inference fails, the same resolved model is retried on CPU rather than silently switching models.
+
+Cached artifacts are stored in a path-hashed, source-specific directory under `.tmp`. Audio, vocal stems, extracted subtitles, and transcription results have manifests containing source metadata and the settings that produced them. Changing the source file, track, model, voice-separation setting, backend version, or related processing options invalidates only the affected artifact. Outputs are written atomically, and transcription is cached as stable-ts JSON so subtitle rendering and alignment can be repeated without running speech recognition again.
+
+Subtitle matching uses dialogue-anchor filtering and monotonic temporal alignment. The matcher estimates global offset and small clock drift only when the evidence improves coverage, then supports one-to-one, one-to-many, and many-to-one cue mappings. Positioned signs and titles remain in the output but are not normally used as spoken-dialogue anchors. When word timestamps are available, a transcription segment spanning multiple base cues is split at word boundaries.
 
 ## 🈳 Romanization Support
 
@@ -223,6 +233,7 @@ The accuracy of the transcription is determined by the underlying Whisper AI mod
 2. To improve transcription accuracy:
    - Use the `--voice-separation` option to isolate voice from background noise
    - Choose a larger model (e.g., `large-v3`) for better accuracy at the cost of speed
+   - Use `turbo` when throughput matters more than the small accuracy advantage of `large-v3`
 
 The model will automatically be selected based on your system's capabilities, but you can override this with the `--whisper-model` option.
 
@@ -237,15 +248,35 @@ The subtitle merging process employs a smart positioning algorithm to handle mul
      - Subtitle ordering cannot be guaranteed
      - Advanced positioning features will not be available
 
-2. Smart Positioning:
-   - The algorithm intelligently repositions subtitles to avoid overlap
-   - Timing-based synchronization uses the specified sync tolerance
+2. Alignment and positioning:
+   - Dialogue cues are matched in sequence so later speech is not mapped backward
+   - Global offset and drift correction are accepted only when supported by enough anchors
+   - Many-to-many mappings preserve split or combined subtitle phrasing
+   - Word timing is used to split transcription at word boundaries where available
    - Smart layering helps maintain readability when multiple lines appear simultaneously
 
 3. Overlap Handling:
    - By default, smart layering is enabled to handle overlapping subtitles
    - If you experience issues with subtitle ordering, you can use `--disable-layers`
    - Note that disabling layers may affect the visual presentation of concurrent subtitles
+
+## Development
+
+The CLI entry point is `whispersub.py`. Processing is divided into focused modules under `src`: extraction and vocal separation in `audio.py`, recognition in `transcription.py`, pure temporal matching in `alignment.py`, rendering in `subtitles.py`, and artifact validation in `cache.py`. ML imports remain lazy so merge-only workflows do not need to initialize PyTorch or stable-ts.
+
+Run the unit suite after installing the project requirements:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+Run the synthetic alignment benchmark independently:
+
+```bash
+python scripts/benchmark_alignment.py --events 10000
+```
+
+See [AGENTS.md](AGENTS.md) for repository conventions and [the implementation design](docs/plans/2026-07-16-performance-alignment-turbo-design.md) for the rationale behind the current architecture.
 
 ## License
 

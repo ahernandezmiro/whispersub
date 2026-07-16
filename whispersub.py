@@ -11,12 +11,18 @@ from src.transcription import transcribe_with_whisper
 from src.subtitles import extract_subtitles, merge_subtitles
 from src.utils import clear_cache_for_file, file_exists, temp_dir
 
-def verify_command_line_tools():
+def verify_command_line_tools(args):
     """Verify that all required command-line tools are installed and accessible."""
-    required_tools = {
-        'ffmpeg': 'ffmpeg',
-        'mkvextract': 'mkvextract',
-    }
+    required_tools = {}
+    if args.transcribe:
+        required_tools['ffmpeg'] = 'ffmpeg'
+    needs_subtitle_extraction = args.merge and (
+        not args.base_subs or (not args.transcribe and not args.merge_subs)
+    )
+    if needs_subtitle_extraction:
+        required_tools['mkvextract'] = 'mkvextract'
+    if args.merge and not args.base_subs and args.subtitle_track is None:
+        required_tools['mkvinfo'] = 'mkvinfo'
     
     if platform.system() == "Windows":
         required_tools = {k: f"{v}.exe" for k, v in required_tools.items()}
@@ -102,13 +108,7 @@ def validate_inputs(args):
     if args.rom_margin:
         validate_number_expression(args.rom_margin)
     if args.rom_color:
-        validate_color(args.trans_color)
-
-        
-    valid_models = ["tiny", "base", "small", "medium", "large", "large-v2", "large-v3"]
-    if args.whisper_model and args.whisper_model not in valid_models:
-        print(f"[ERROR] Invalid Whisper model '{args.whisper_model}' specified. Valid models: {', '.join(valid_models)}")
-        sys.exit(1)
+        validate_color(args.rom_color)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -133,7 +133,7 @@ def main():
     transcription_group.add_argument("--audio-track", type=int, default=1,
                         help="Index of the audio track to extract (default=1).")
     transcription_group.add_argument("--whisper-model", type=str,
-                        help="Which Whisper model to use (tiny, base, small, medium, large, ...).")
+                        help="Whisper model name or compatible Faster-Whisper model path (built-ins: tiny, base, small, medium, large, large-v2, large-v3, turbo).")
     transcription_group.add_argument("--force-cpu",
                         help="Force CPU usage for transcription.", action="store_true")    
     transcription_group.add_argument("--romanize", action="store_true",
@@ -154,7 +154,7 @@ def main():
     subtitle_group.add_argument("--merge-subs",
                         help="Path to existing secondary subtitles file (required for merge-only mode, alternative to --merge-track).")
     subtitle_group.add_argument("--sync-tolerance", type=int, default=200,
-                        help="Sync tolerance in milliseconds for merging subtitles (default=50).")
+                        help="Sync tolerance in milliseconds for merging subtitles (default=200).")
     subtitle_group.add_argument("--disable-layers", action="store_true",
                         help="Disable smart subtitle layering mode. Read more in README.")
     
@@ -181,8 +181,6 @@ def main():
 
     args = parser.parse_args()
 
-    verify_command_line_tools()
-    
     validate_inputs(args)
 
     if not (args.transcribe or args.merge):
@@ -190,6 +188,8 @@ def main():
     
     if not args.i:
         parser.error("--i is required")
+
+    verify_command_line_tools(args)
     
     if args.merge:
 
@@ -212,12 +212,13 @@ def main():
 
     # Clear cache if requested
     if args.clear_cache:
-        clear_cache_for_file(filename)
+        clear_cache_for_file(filename, file_input_path)
 
     output_subs_path = args.o or f"{filename}.ass"
-    file_tmp_dir = temp_dir(filename)
+    file_tmp_dir = temp_dir(filename, file_input_path)
     
     transcribed_subs_path = None
+    transcription_result_path = None
     detected_lang = None
     
     if args.transcribe:
@@ -227,6 +228,7 @@ def main():
         input_for_whisper = raw_audio_path
         
         transcribed_subs_path = os.path.join(file_tmp_dir, f'{args.audio_track}_transcribed.srt')
+        transcription_result_path = os.path.join(file_tmp_dir, f'{args.audio_track}_transcribed.json')
         lang_cache_path = os.path.join(file_tmp_dir, f'{args.audio_track}_detected_lang.txt')
         detected_lang, transcribed_subs_path = transcribe_with_whisper(
             input_for_whisper,
@@ -234,7 +236,8 @@ def main():
             lang_cache_path=lang_cache_path,
             model_name=args.whisper_model,
             voice_separation=args.voice_separation,
-            force_cpu=args.force_cpu
+            force_cpu=args.force_cpu,
+            result_json_path=transcription_result_path,
         )
     
     base_subs_path = None
@@ -261,7 +264,10 @@ def main():
             else:
                 second_subs_path = args.merge_subs
         
-    if args.merge or (args.transcribe and (args.romanize or not args.word_level)):
+    render_transcription = args.transcribe and (
+        args.romanize or not args.word_level or output_subs_path.lower().endswith('.ass')
+    )
+    if args.merge or render_transcription:
 
         style_config = {
             'transcription': {},
@@ -291,6 +297,7 @@ def main():
             base_subs_path=base_subs_path,
             second_subs_path=second_subs_path,
             transcribed_subs_path=transcribed_subs_path,
+            transcription_result_path=transcription_result_path,
             output_subs_path=output_subs_path,
             detected_language=detected_lang,
             need_romanization=args.romanize,

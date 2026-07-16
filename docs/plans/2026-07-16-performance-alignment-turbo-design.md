@@ -51,7 +51,7 @@ Use Stable-ts's Faster-Whisper integration for all ordinary transcription, inclu
 
 ### Voice separation
 
-Keep separation as preprocessing rather than a reason to switch to vanilla Whisper. Stable-ts continues to invoke Demucs, but the Faster-Whisper backend remains active. Separation settings participate in the transcription cache fingerprint.
+Keep separation as preprocessing rather than a reason to switch to vanilla Whisper. Demucs produces an independently cached vocal stem, which ffmpeg normalizes to 16 kHz mono before the Faster-Whisper backend consumes it. A GPU separation failure retries Demucs on CPU without changing the selected Whisper model. Separation settings participate in both the stem and transcription cache fingerprints.
 
 ## Phase 3: subtitle alignment
 
@@ -79,7 +79,7 @@ Related fixes include appending the currently discarded leading fragment, boundi
 
 ## Phase 4: Whisper Turbo
 
-Add `turbo` to the accepted Whisper model names while preserving every existing model. A small model registry centralizes canonical names and rough memory classes.
+Add `turbo` to the advertised Whisper model names while preserving every existing model. A small model registry centralizes canonical names and rough memory classes. Custom model identifiers and filesystem paths supported by Faster-Whisper remain accepted.
 
 Automatic model selection remains backward compatible in this iteration; Turbo is explicitly available through `--whisper-model turbo`. Benchmarks can justify a later default change.
 

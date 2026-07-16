@@ -1,9 +1,20 @@
 import subprocess
 import re
+import json
+import os
+from bisect import bisect_left, bisect_right
 import pysubs2
 
+from .alignment import (
+    AlignmentEvent,
+    WordTiming,
+    align_events,
+    snap_times,
+    split_words_across_bases,
+)
+from .cache import atomic_output_path, build_manifest, cache_is_valid, write_manifest
 from .romanization import romanization_converter
-from .utils import file_exists, hex_to_binary
+from .utils import hex_to_binary
 
 def extract_formatting_tags(text):
     # Patterns for common formatting tags - improved to handle ASS format better
@@ -98,20 +109,27 @@ def extract_subtitles(input_mkv, output_subs, subtitle_track_index=None):
             print(f"[ERROR] Failed to detect subtitle track index: {e}")
             raise
 
-    if file_exists(output_subs):
+    manifest = build_manifest(
+        "subtitle-extraction",
+        input_mkv,
+        {"track_index": subtitle_track_index},
+    )
+    if cache_is_valid(output_subs, manifest):
         print(f"[INFO] Subtitle extraction: '{output_subs}' already exists.")
         return output_subs
     
 
     # mkvextract tracks input.mkv subtitle_track_index:english_subs.srt
-    cmd = [
-        "mkvextract",
-        "tracks",
-        input_mkv,
-        f"{subtitle_track_index}:{output_subs}"
-    ]
-    print("[INFO] Extracting subtitles with mkvextract:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    with atomic_output_path(output_subs) as temporary_output:
+        cmd = [
+            "mkvextract",
+            "tracks",
+            input_mkv,
+            f"{subtitle_track_index}:{temporary_output}"
+        ]
+        print("[INFO] Extracting subtitles with mkvextract:", " ".join(cmd))
+        subprocess.run(cmd, check=True)
+    write_manifest(output_subs, manifest)
 
     return output_subs
 
@@ -135,10 +153,10 @@ def html_font_to_ass(text, highlight_color=None):
     # Replace opening tag
     text = re.sub(r'<font color="(#[0-9a-fA-F]{6})">', repl, text)
     # Replace closing tag with ASS color reset to white (default color)
-    text = text.replace('</font>', "{\c}")
+    text = text.replace('</font>', r"{\c}")
     return text
 
-def aggregate_subtitle_lines(subs):
+def aggregate_subtitle_lines(subs, max_gap=1000):
     aggregated_rec = []
     j = 0
     while j < len(subs):
@@ -160,7 +178,7 @@ def aggregate_subtitle_lines(subs):
                 continue
                 
             next_clean = extract_formatting_tags(next_event.text)[0]
-            if next_clean != clean_text:
+            if next_clean != clean_text or next_event.start - agg_end > max_gap:
                 break
                 
             # Extend the aggregated event time
@@ -171,7 +189,8 @@ def aggregate_subtitle_lines(subs):
         agg_event = pysubs2.SSAEvent(
             start=agg_start,
             end=agg_end,
-            text=rec_event.text  # Keep original text for style preservation
+            text=rec_event.text,
+            style=rec_event.style,
         )
         aggregated_rec.append(agg_event)
         j = k
@@ -251,9 +270,10 @@ def create_style_if_not_exists(event, merged, name_suffix, style_properties):
     """
     Creates a new style based on the event's style with modified properties.
     """
-    if event and event.style and event.style in merged.styles:
-        base_style = merged.styles[event.style].copy()
-        style_name = f"{name_suffix}_{event.style}"
+    if event:
+        base_style_name = event.style if event.style in merged.styles else "Default"
+        base_style = merged.styles[base_style_name].copy()
+        style_name = f"{name_suffix}_{base_style_name}"
         
         if style_name not in merged.styles:
             for prop, value in style_properties.items():
@@ -275,7 +295,7 @@ def initialize_merged_file(subs_base=None):
         for info_name, info in subs_base.info.items():
             if str(info_name).lower() == "collisions":
                 merged.info[info_name] = "Normal"
-            if str(info_name).lower() == "wrapstyle":
+            elif str(info_name).lower() == "wrapstyle":
                 merged.info[info_name] = 3
             else:
                 merged.info[info_name] = info
@@ -360,66 +380,103 @@ def initialize_default_styles(merged, style_config=None):
 def try_load_subtitles(file_path):
     if not file_path:
         return []
-
-    # First attempt: Try UTF-8 with replacement character handling
-    try:
-        with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
-            content = f.read()
-            try:
-                return pysubs2.SSAFile.from_string(content, keep_html_tags=True)
-            except Exception:
-                pass  # If this fails, try other approaches
-    except Exception:
-        pass
-
-    # Read file as binary to examine content
     try:
         with open(file_path, 'rb') as f:
             raw_data = f.read()
-            
-        # Check for UTF-16 BOM
-        if raw_data.startswith((b'\xff\xfe', b'\xfe\xff')):
-            encoding = 'utf-16le' if raw_data.startswith(b'\xff\xfe') else 'utf-16be'
+    except OSError as error:
+        raise ValueError(f"Failed to read {file_path}: {error}") from error
+
+    encodings = []
+    if raw_data.startswith((b'\xff\xfe', b'\xfe\xff')):
+        encodings.append('utf-16')
+    encodings.extend([
+        'utf-8-sig', 'utf-16-le', 'utf-16-be',
+        'cp932', 'shift_jis', 'euc_jp', 'cp1252',
+    ])
+    errors = []
+    for encoding in dict.fromkeys(encodings):
+        try:
+            content = raw_data.decode(encoding, errors='strict')
             try:
-                content = raw_data.decode(encoding)
                 return pysubs2.SSAFile.from_string(content, keep_html_tags=True)
-            except Exception:
-                pass
+            except pysubs2.exceptions.FormatError as error:
+                errors.append(f"{encoding}: format error - {error}")
+        except UnicodeDecodeError as error:
+            errors.append(f"{encoding}: {error}")
+    details = "\n".join(errors)
+    raise ValueError(f"Failed to decode or parse {file_path}:\n{details}")
 
-        # Try other encodings with error handlers
-        encodings = [
-            ('utf-8', 'strict'),
-            ('utf-8', 'replace'),
-            ('utf-8', 'ignore'),
-            ('utf-16le', 'replace'),
-            ('utf-16be', 'replace'),
-            ('cp1252', 'replace'),
-            ('iso-8859-1', 'replace'),
-            ('shift_jis', 'replace'),
-            ('euc_jp', 'replace'),
-            ('cp932', 'replace'),
-        ]
 
-        errors = []
-        for encoding, error_handler in encodings:
-            try:
-                content = raw_data.decode(encoding, errors=error_handler)
-                try:
-                    return pysubs2.SSAFile.from_string(content, keep_html_tags=True)
-                except pysubs2.exceptions.FormatError as e:
-                    errors.append(f"{encoding} ({error_handler}): Format error - {str(e)}")
-                    continue
-            except Exception as e:
-                errors.append(f"{encoding} ({error_handler}): {str(e)}")
-                continue
+def load_transcription_words(result_path):
+    if not result_path or not os.path.isfile(result_path):
+        return []
+    try:
+        with open(result_path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError, TypeError):
+        return []
+    segments = data.get("segments", []) if isinstance(data, dict) else data
+    words = []
+    for segment in segments or []:
+        for word in segment.get("words", []) or []:
+            text = word.get("word", word.get("text", ""))
+            if text and word.get("start") is not None and word.get("end") is not None:
+                words.append(WordTiming(
+                    start=round(float(word["start"]) * 1000),
+                    end=round(float(word["end"]) * 1000),
+                    text=text,
+                ))
+    return words
 
-        error_msg = f"Failed to decode {file_path} with any of the attempted encodings:\n"
-        error_msg += "\n".join(errors)
-        raise ValueError(error_msg)
-            
-    except Exception as e:
-        raise ValueError(f"Failed to read {file_path}: {str(e)}")
-    
+
+def _normalize_base_events(subs_base, merged):
+    normalized = []
+    for index, event in enumerate(subs_base):
+        style_name = event.style if event.style in merged.styles else "Default"
+        style = merged.styles[style_name]
+        normalized.append(AlignmentEvent(
+            start=event.start,
+            end=event.end,
+            index=index,
+            text=extract_formatting_tags(event.text)[0],
+            style=style_name,
+            alignment=getattr(style, "alignment", 2),
+            positioned=bool(re.search(r'\\(?:pos|move)\(', event.text)),
+        ))
+    return normalized
+
+
+def _normalize_secondary_events(second_subs, words=None):
+    words = sorted(words or [], key=lambda word: word.start)
+    word_starts = [word.start for word in words]
+    word_ends = [word.end for word in words]
+    normalized = []
+    for index, event in enumerate(second_subs):
+        first_word = bisect_right(word_ends, event.start)
+        last_word = bisect_left(word_starts, event.end)
+        normalized.append(AlignmentEvent(
+            start=event.start,
+            end=event.end,
+            index=index,
+            text=extract_formatting_tags(event.text)[0],
+            style=event.style,
+            words=tuple(words[first_word:last_word]),
+        ))
+    return normalized
+
+
+def _snap_word_group(words, base_event, match, tolerance):
+    start = words[0].start
+    end = words[-1].end
+    corrected_start = match.transform.apply(start)
+    corrected_end = match.transform.apply(end)
+    if match.confidence >= 0.5 and abs(corrected_start - base_event.start) <= tolerance:
+        start = base_event.start
+    if match.confidence >= 0.5 and abs(corrected_end - base_event.end) <= tolerance:
+        end = base_event.end
+    return (start, end) if end > start else (words[0].start, words[-1].end)
+
+
 def merge_subtitles(
     base_subs_path,
     second_subs_path,
@@ -430,7 +487,8 @@ def merge_subtitles(
     highlight_current_word=False,
     sync_tolerance=200,
     style_config=None,
-    disable_layers=False
+    disable_layers=False,
+    transcription_result_path=None,
 ):
     """
     Merge base subtitles with recognized text, creating proper sync.
@@ -487,114 +545,127 @@ def merge_subtitles(
                 **({"layer": 1} if not disable_layers else {})
             ))
     
-    # Process secondary events
-    for sec_event in second_subs:
+    transcription_words = (
+        load_transcription_words(transcription_result_path)
+        if is_transcription and not highlight_current_word else []
+    )
+    normalized_base = _normalize_base_events(subs_base, merged)
+    normalized_secondary = _normalize_secondary_events(second_subs, transcription_words)
+    matches = align_events(normalized_base, normalized_secondary, sync_tolerance)
+
+    # Process secondary events using monotonic, many-to-many alignment.
+    for position, sec_event in enumerate(second_subs):
         if not sec_event.text.strip():
-            return
-            
-        text = html_font_to_ass(sec_event.text, highlight_color) if highlight_current_word else extract_formatting_tags(sec_event.text)[0]
-        t_start = sec_event.start
-        t_end = sec_event.end
+            continue
 
-        # Find matching base event(s) based on time overlap
-        matching_base_events = [
-            e for e in subs_base 
-            if (sec_event.start <= e.end and sec_event.end >= e.start)
-        ]
-        
-        n_lines = 1
-        sec_style = "Transcription" if is_transcription else (sec_event.style if sec_event.style in merged.styles else "Secondary")
-        best_match = None
-
-        if matching_base_events:
-            ''' TODO: process all matching events, not just best match.
-             update start and end times in the current approach, generating various subtitles if applicable
-             adjust style for each segment to its related matching event one
-            '''
-            # Find the best matching base event
-            best_match = min(matching_base_events, key=lambda e: 
-                abs(e.start - sec_event.start) + abs(e.end - sec_event.end))
-            
-            n_lines = len(re.findall(r'\\N', best_match.text)) + 1 
-            sec_style = f"{sec_style}_{n_lines}"
-            if is_transcription:
-                # Calculate style properties with adjustments for n_lines
-                style_config = calculate_adjusted_style_properties(
-                    merged.styles[best_match.style],
-                    trans_config,
-                    sec_style,
-                    n_lines
-                )
-
-                # Create style with adjusted properties
-                sec_style = create_style_if_not_exists(best_match, merged, sec_style, style_config)
-            else:
-                # Calculate style properties with adjustments for n_lines
-                sec_config = calculate_adjusted_style_properties(
-                    merged.styles[best_match.style],
-                    {},
-                    sec_style,
-                    n_lines
-                )
-                sec_style = create_style_if_not_exists(best_match, merged, sec_style, sec_config)
-
-            # Snap to base event times if within tolerance
-            if abs(sec_event.start - best_match.start) <= sync_tolerance:
-                t_start = best_match.start
-            if abs(sec_event.end - best_match.end) <= sync_tolerance:
-                if(t_start < best_match.start - sync_tolerance):
-                    t_start = best_match.start + 1
-                    alt_event = pysubs2.SSAEvent(
-                        start=sec_event.start,
-                        end=best_match.start,
-                        text=text,
-                        style=sec_style,
-                        **({"layer": 2} if not disable_layers else {})
-                    )
-                t_end = best_match.end
-    
-        # Add the main secondary event
-        alt_event = pysubs2.SSAEvent(
-            start=t_start,
-            end=t_end,
-            text=text,
-            style=sec_style,
-            **({"layer": 2} if not disable_layers else {})
+        normalized_event = normalized_secondary[position]
+        match = matches.get(position)
+        variants = []
+        word_groups = split_words_across_bases(
+            normalized_event.words,
+            match,
+            normalized_base,
         )
-        merged.append(alt_event)
+        if word_groups:
+            for base_position, words in word_groups:
+                piece_text = "".join(word.text for word in words).strip()
+                if not piece_text:
+                    continue
+                start, end = _snap_word_group(
+                    words,
+                    normalized_base[base_position],
+                    match,
+                    sync_tolerance,
+                )
+                variants.append((piece_text, start, end, base_position))
+        else:
+            start, end = snap_times(
+                normalized_event,
+                match,
+                normalized_base,
+                sync_tolerance,
+            )
+            base_position = match.primary if match else None
+            variants.append((sec_event.text, start, end, base_position))
 
-        # Process romanization if needed
-        if need_romanization and converter:
-            clean_text, tags_info = extract_formatting_tags(sec_event.text)
-            romanized = converter.romanize(clean_text)
-            if romanized.strip():
-                romanized_text = reapply_formatting_tags(romanized, tags_info) if highlight_current_word else romanized
+        for source_text, t_start, t_end, base_position in variants:
+            best_match = subs_base[base_position] if base_position is not None else None
+            display_text = (
+                html_font_to_ass(source_text, highlight_color)
+                if highlight_current_word
+                else extract_formatting_tags(source_text)[0]
+            )
+            if not display_text.strip() or t_end <= t_start:
+                continue
 
+            n_lines = len(re.findall(r'\\N', best_match.text)) + 1 if best_match else 1
+            sec_style = (
+                "Transcription"
+                if is_transcription
+                else (sec_event.style if sec_event.style in merged.styles else "Secondary")
+            )
+            if best_match:
+                style_suffix = f"{sec_style}_{n_lines}"
+                base_style_name = best_match.style if best_match.style in merged.styles else "Default"
+                adjustment_source = trans_config if is_transcription else {}
+                adjusted_config = calculate_adjusted_style_properties(
+                    merged.styles[base_style_name],
+                    adjustment_source,
+                    style_suffix,
+                    n_lines,
+                )
+                sec_style = create_style_if_not_exists(
+                    best_match,
+                    merged,
+                    style_suffix,
+                    adjusted_config,
+                ) or sec_style
+
+            merged.append(pysubs2.SSAEvent(
+                start=t_start,
+                end=t_end,
+                text=display_text,
+                style=sec_style,
+                **({"layer": 2} if not disable_layers else {})
+            ))
+
+            if need_romanization and converter:
+                clean_text, tags_info = extract_formatting_tags(source_text)
+                romanized = converter.romanize(clean_text)
+                if not romanized or not romanized.strip():
+                    continue
+                romanized_text = (
+                    reapply_formatting_tags(romanized, tags_info)
+                    if highlight_current_word else romanized
+                )
                 romanized_style = "Romanized"
                 if best_match:
-                    trans_lines = len(re.findall(r'\\N', sec_event.text)) + 1 # TODO: also account for ASS auto line wrapping
-                    romanized_style = f"Romanized_{n_lines}_{trans_lines}"
-
-                    # Calculate style properties with adjustments for n_lines
+                    trans_lines = len(re.findall(r'\\N', display_text)) + 1
+                    romanized_suffix = f"Romanized_{n_lines}_{trans_lines}"
+                    base_style_name = best_match.style if best_match.style in merged.styles else "Default"
                     adjusted_rom_config = calculate_adjusted_style_properties(
-                        merged.styles[best_match.style],
+                        merged.styles[base_style_name],
                         rom_config,
-                        romanized_style,
+                        romanized_suffix,
                         n_lines,
                         trans_config,
-                        trans_lines
+                        trans_lines,
                     )
-                    romanized_style = create_style_if_not_exists(best_match, merged, romanized_style, adjusted_rom_config)
-
-                romanized_event = pysubs2.SSAEvent(
+                    romanized_style = create_style_if_not_exists(
+                        best_match,
+                        merged,
+                        romanized_suffix,
+                        adjusted_rom_config,
+                    ) or romanized_style
+                merged.append(pysubs2.SSAEvent(
                     start=t_start,
                     end=t_end,
                     text=romanized_text,
                     style=romanized_style,
                     **({"layer": 3} if not disable_layers else {})
-                )
-                merged.append(romanized_event)
+                ))
 
     # Finalize and save the merged subtitles
     merged.sort()
-    merged.save(output_subs_path)
+    with atomic_output_path(output_subs_path) as temporary_output:
+        merged.save(temporary_output)
