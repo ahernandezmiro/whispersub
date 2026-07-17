@@ -13,6 +13,14 @@ from .alignment import (
     split_words_across_bases,
 )
 from .cache import atomic_output_path, build_manifest, cache_is_valid, write_manifest
+from .layout import (
+    EventRole,
+    FontAwareTextMeasurer,
+    LayoutEvent,
+    ObstacleIndex,
+    classify_event_role,
+    plan_generated_layout,
+)
 from .romanization import romanization_converter
 from .utils import hex_to_binary
 
@@ -197,92 +205,51 @@ def aggregate_subtitle_lines(subs, max_gap=1000):
 
     return aggregated_rec
 
-def calculate_adjusted_style_properties(base_style, config, name_suffix, n_lines, trans_config=None, trans_lines=1):
-    """
-    Calculate adjusted style properties based on configuration and number of lines.
-    
-    Args:
-        base_style: The base style to derive properties from
-        config: Style configuration dictionary
-        name_suffix: Style name suffix ("Transcription" or "Romanized")
-        n_lines: Number of lines in the text
-        trans_config: Optional transcription config for romanization margin calculation
-        trans_lines: Number of lines in the transcription text
-    """
+def _resolve_relative_value(value, base_value, property_name):
+    if value is None:
+        return base_value
     try:
-        adjusted_config = config.copy()
-        
-        # Get base values
-        base_fontsize = getattr(base_style, 'fontsize', None)
-        trans_fontsize = 16
+        if isinstance(value, str):
+            if value.startswith('*'):
+                return base_value * float(value[1:])
+            if value.startswith('+'):
+                return base_value + float(value[1:])
+            if value.startswith('-'):
+                return base_value - float(value[1:])
+        return float(value)
+    except (TypeError, ValueError):
+        print(f'[WARNING] Invalid {property_name} value: {value}. Using {base_value}.')
+        return base_value
 
-        base_marginv = getattr(base_style, 'marginv', None)
-        
-        # Set default values if not present
-        if base_fontsize is None:
-            base_fontsize = 16 if "Transcription" in name_suffix else 12
-        if base_marginv is None:
-            base_marginv = 10 if "Transcription" in name_suffix else 30
 
-        for prop, value in config.items():
-            if prop in ['fontsize', 'marginv'] and value is not None:
-                base_value = getattr(base_style, prop, None)
-                if base_value is None:
-                    base_value = base_fontsize if prop == 'fontsize' else base_marginv
-                
-                if prop == 'marginv':
-                    base_value = base_value * n_lines
+def _generated_style_name(base_name, zone, alignment, marginv, fontsize):
+    size_key = f'{fontsize:.2f}'.rstrip('0').rstrip('.').replace('.', 'p')
+    return f'{base_name}_{zone}_an{alignment}_m{marginv}_s{size_key}'
 
-                if isinstance(value, str):
-                    try:
-                        if value.startswith('+'):
-                            adjusted_config[prop] = int(base_value + float(value[1:]))
-                        if value.startswith('-'):
-                            adjusted_config[prop] = int(base_value - float(value[1:]))
-                        elif value.startswith('*'):
-                            adjusted_config[prop] = int(base_value * float(value[1:]))
-                        else:  # Absolute value
-                            adjusted_config[prop] = int(float(value))
-                    except (ValueError, ZeroDivisionError) as e:
-                        print(f"[WARNING] Invalid format for {prop} value: {value}. Using base value. Error: {e}")
-                        adjusted_config[prop] = base_value
-                
-                if prop == 'fontsize':
-                    trans_fontsize = adjusted_config[prop]
-            elif prop in ['primarycolor', 'secondarycolor']:
-                adjusted_config[prop] = hex_to_binary(value)
-            else:
-                adjusted_config[prop] = value
-                
-        if "marginv" not in adjusted_config:
-            if "Transcription" in name_suffix:
-                adjusted_config["marginv"] = base_marginv + base_fontsize * n_lines
-            elif "Romanized" in name_suffix and trans_config:
-                adjusted_config["marginv"] = base_marginv + base_fontsize * n_lines + trans_fontsize * trans_lines + 7
-            else:
-                adjusted_config["marginv"] = base_marginv + base_fontsize * n_lines
-        return adjusted_config
-    except Exception as e:
-        print(f"[ERROR] Failed to calculate adjusted style properties for {name_suffix}: {e}")
-        return config
 
-def create_style_if_not_exists(event, merged, name_suffix, style_properties):
-    """
-    Creates a new style based on the event's style with modified properties.
-    """
-    if event:
-        base_style_name = event.style if event.style in merged.styles else "Default"
-        base_style = merged.styles[base_style_name].copy()
-        style_name = f"{name_suffix}_{base_style_name}"
-        
-        if style_name not in merged.styles:
-            for prop, value in style_properties.items():
-                base_style.__setattr__(prop, value)
-            
-            merged.styles[style_name] = base_style
-        
-        return style_name
-    return None
+def _ensure_generated_style(merged, base_name, zone, alignment, marginv, fontsize):
+    style_name = _generated_style_name(
+        base_name, zone, alignment, marginv, fontsize
+    )
+    if style_name not in merged.styles:
+        style = merged.styles[base_name].copy()
+        style.alignment = pysubs2.Alignment(alignment)
+        style.marginv = marginv
+        style.fontsize = fontsize
+        merged.styles[style_name] = style
+    return style_name
+
+
+def _available_generated_base_name(merged, preferred):
+    if preferred not in merged.styles:
+        return preferred
+    stem = f'WhisperSub_{preferred}'
+    candidate = stem
+    suffix = 2
+    while candidate in merged.styles:
+        candidate = f'{stem}_{suffix}'
+        suffix += 1
+    return candidate
 
 def initialize_merged_file(subs_base=None):
     merged = pysubs2.SSAFile()
@@ -290,7 +257,7 @@ def initialize_merged_file(subs_base=None):
     if subs_base:
         # Copy all styles from base subtitles to preserve formatting
         for style_name, style in subs_base.styles.items():
-            merged.styles[style_name] = style
+            merged.styles[style_name] = style.copy()
 
         for info_name, info in subs_base.info.items():
             if str(info_name).lower() == "collisions":
@@ -303,6 +270,8 @@ def initialize_merged_file(subs_base=None):
     return merged
 
 def initialize_default_styles(merged, style_config=None):
+    trans_style_name = _available_generated_base_name(merged, 'Transcription')
+    rom_style_name = _available_generated_base_name(merged, 'Romanized')
     trans_config = style_config.get("transcription", {}) if style_config else {}
     rom_config = style_config.get('romanization', {}) if style_config else {}
     
@@ -330,11 +299,14 @@ def initialize_default_styles(merged, style_config=None):
         merged.styles["Secondary"] = merged.styles["Default"].copy()
         merged.styles["Secondary"].marginv = 30
         
-    if not "Transcription" in merged.styles:
-        font_size = trans_config.get('fontsize')
-        if not font_size or str(font_size).startswith(('*', '+', '-')):
-             font_size = 16
-        merged.styles["Transcription"] = pysubs2.SSAStyle(
+    if trans_style_name not in merged.styles:
+        font_size = _resolve_relative_value(
+            trans_config.get('fontsize'), 16, 'transcription font size'
+        )
+        marginv = _resolve_relative_value(
+            trans_config.get('marginv'), 30, 'transcription margin'
+        )
+        merged.styles[trans_style_name] = pysubs2.SSAStyle(
             fontname=trans_config.get('fontname', 'Arial'),
             fontsize=font_size,
             bold=trans_config.get('bold', False),
@@ -343,7 +315,7 @@ def initialize_default_styles(merged, style_config=None):
             strikeout=False,
             outline=1,
             shadow=1,
-            marginv=30,
+            marginv=marginv,
             alignment=2,
             primarycolor=hex_to_binary(trans_config.get('primarycolor', 'FFFFFF')),
             secondarycolor=hex_to_binary(trans_config.get('secondarycolor', 'FFFFFF')),
@@ -353,11 +325,14 @@ def initialize_default_styles(merged, style_config=None):
             scalex=100,
             scaley=100
         )
-    if not "Romanized" in merged.styles:
-        font_size = rom_config.get('fontsize')
-        if not font_size or str(font_size).startswith(('*', '+', '-')):
-             font_size = 12
-        merged.styles["Romanized"] = pysubs2.SSAStyle(
+    if rom_style_name not in merged.styles:
+        font_size = _resolve_relative_value(
+            rom_config.get('fontsize'), 12, 'romanization font size'
+        )
+        marginv = _resolve_relative_value(
+            rom_config.get('marginv'), 50, 'romanization margin'
+        )
+        merged.styles[rom_style_name] = pysubs2.SSAStyle(
             fontname=rom_config.get('fontname', 'Arial'),
             fontsize=font_size,
             bold=rom_config.get('bold', False),
@@ -366,7 +341,7 @@ def initialize_default_styles(merged, style_config=None):
             strikeout=False,
             outline=1,
             shadow=1,
-            marginv=50,
+            marginv=marginv,
             alignment=2,
             primarycolor=hex_to_binary(rom_config.get('primarycolor', 'BCBCBC')),
             secondarycolor=hex_to_binary(rom_config.get('secondarycolor', 'BCBCBC')),
@@ -376,6 +351,8 @@ def initialize_default_styles(merged, style_config=None):
             scalex=100,
             scaley=100
         )
+
+    return trans_style_name, rom_style_name
 
 def try_load_subtitles(file_path):
     if not file_path:
@@ -434,16 +411,75 @@ def _normalize_base_events(subs_base, merged):
     for index, event in enumerate(subs_base):
         style_name = event.style if event.style in merged.styles else "Default"
         style = merged.styles[style_name]
+        positioned = (
+            bool(re.search(r'\\(?:pos|move)\(', event.text))
+            or getattr(event, 'is_comment', False)
+        )
+        alignment_tag = re.search(r'\\an([1-9])', event.text)
+        alignment = (
+            int(alignment_tag.group(1))
+            if alignment_tag else getattr(style, 'alignment', 2)
+        )
+        role = classify_event_role(
+            event.text,
+            style_name,
+            alignment,
+            positioned,
+            getattr(event, 'effect', ''),
+        )
         normalized.append(AlignmentEvent(
             start=event.start,
             end=event.end,
             index=index,
             text=extract_formatting_tags(event.text)[0],
             style=style_name,
-            alignment=getattr(style, "alignment", 2),
-            positioned=bool(re.search(r'\\(?:pos|move)\(', event.text)),
+            alignment=alignment,
+            positioned=positioned,
+            role=role.value,
         ))
     return normalized
+
+
+def _script_resolution(merged):
+    def parse(name, default):
+        try:
+            return max(1, int(float(merged.info.get(name, default))))
+        except (TypeError, ValueError):
+            return default
+
+    return parse('PlayResX', 384), parse('PlayResY', 288)
+
+
+def _layout_events(subs_base, merged, normalized_base):
+    events = []
+    for event, normalized in zip(subs_base, normalized_base):
+        if not event.text.strip() or getattr(event, 'is_comment', False):
+            continue
+        style_name = event.style if event.style in merged.styles else 'Default'
+        events.append(LayoutEvent(
+            start=event.start,
+            end=event.end,
+            text=event.text,
+            style=merged.styles[style_name],
+            role=EventRole(normalized.role),
+            layer=getattr(event, 'layer', 0),
+            marginl=getattr(event, 'marginl', 0),
+            marginr=getattr(event, 'marginr', 0),
+            marginv=getattr(event, 'marginv', 0),
+        ))
+    return events
+
+
+def _layout_anchor(match, normalized_base):
+    if not match or match.confidence < 0.5:
+        return None
+    eligible = [
+        position for position in match.bases
+        if normalized_base[position].role == EventRole.DIALOGUE.value
+    ]
+    if not eligible:
+        return None
+    return match.primary if match.primary in eligible else eligible[0]
 
 
 def _normalize_secondary_events(second_subs, words=None):
@@ -520,30 +556,46 @@ def merge_subtitles(
            
     merged = initialize_merged_file(subs_base)
 
+    secondary_style_map = {}
     if not is_transcription and second_subs:
-        # Copy all styles from second subtitles to preserve formatting
+        # Preserve both definitions when independent source tracks reuse a name.
         for style_name, style in second_subs.styles.items():
-            merged.styles[style_name] = style
+            target_name = style_name
+            if (
+                target_name in merged.styles
+                and merged.styles[target_name] != style
+            ):
+                stem = f'Secondary_{style_name}'
+                target_name = stem
+                suffix = 2
+                while target_name in merged.styles:
+                    target_name = f'{stem}_{suffix}'
+                    suffix += 1
+            if target_name not in merged.styles:
+                merged.styles[target_name] = style.copy()
+            secondary_style_map[style_name] = target_name
 
-    initialize_default_styles(merged, style_config)
+    trans_style_name, rom_style_name = initialize_default_styles(
+        merged, style_config
+    )
     
     trans_config = style_config.get("transcription", {}) if style_config else {}
     highlight_color = trans_config.get("highlightcolor", None)
-    rom_config = style_config.get('romanization', {}) if style_config else {}
-    
-    second_subs = aggregate_subtitle_lines(second_subs) if not highlight_current_word else [e for e in second_subs if e.text.strip()]
+    if is_transcription:
+        second_subs = (
+            aggregate_subtitle_lines(second_subs)
+            if not highlight_current_word
+            else [event for event in second_subs if event.text.strip()]
+        )
     
     # Process base events
     for base_event in subs_base:
-        if base_event.text.strip():
-            base_style = base_event.style if base_event.style in merged.styles else "Default"
-            merged.append(pysubs2.SSAEvent(
-                start=base_event.start,
-                end=base_event.end,
-                text=base_event.text,
-                style=base_style,
-                **({"layer": 1} if not disable_layers else {})
-            ))
+        base_style = base_event.style if base_event.style in merged.styles else "Default"
+        rendered_base = base_event.copy()
+        rendered_base.style = base_style
+        if not disable_layers:
+            rendered_base.layer = 1
+        merged.append(rendered_base)
     
     transcription_words = (
         load_transcription_words(transcription_result_path)
@@ -552,10 +604,29 @@ def merge_subtitles(
     normalized_base = _normalize_base_events(subs_base, merged)
     normalized_secondary = _normalize_secondary_events(second_subs, transcription_words)
     matches = align_events(normalized_base, normalized_secondary, sync_tolerance)
+    play_res_x = play_res_y = None
+    text_measurer = obstacle_index = None
+    if is_transcription:
+        play_res_x, play_res_y = _script_resolution(merged)
+        text_measurer = FontAwareTextMeasurer()
+        obstacle_index = ObstacleIndex(
+            _layout_events(subs_base, merged, normalized_base),
+            play_res_x,
+            play_res_y,
+            text_measurer,
+        )
 
     # Process secondary events using monotonic, many-to-many alignment.
     for position, sec_event in enumerate(second_subs):
         if not sec_event.text.strip():
+            if not is_transcription:
+                rendered_secondary = sec_event.copy()
+                rendered_secondary.style = secondary_style_map.get(
+                    sec_event.style, 'Secondary'
+                )
+                if not disable_layers:
+                    rendered_secondary.layer = 2
+                merged.append(rendered_secondary)
             continue
 
         normalized_event = normalized_secondary[position]
@@ -588,8 +659,59 @@ def merge_subtitles(
             base_position = match.primary if match else None
             variants.append((sec_event.text, start, end, base_position))
 
-        for source_text, t_start, t_end, base_position in variants:
-            best_match = subs_base[base_position] if base_position is not None else None
+        if is_transcription:
+            utterance_text = extract_formatting_tags(sec_event.text)[0]
+            utterance_romanized = None
+            if need_romanization and converter:
+                utterance_romanized = converter.romanize(utterance_text)
+                if not utterance_romanized or not utterance_romanized.strip():
+                    utterance_romanized = None
+
+            anchor_position = _layout_anchor(match, normalized_base)
+            preferred_zone = 'bottom'
+            if (
+                anchor_position is not None
+                and normalized_base[anchor_position].alignment in (7, 8, 9)
+            ):
+                preferred_zone = 'top'
+            layout_start = min(variant[1] for variant in variants)
+            layout_end = max(variant[2] for variant in variants)
+            layout_plan = plan_generated_layout(
+                utterance_text,
+                merged.styles[trans_style_name],
+                utterance_romanized,
+                merged.styles[rom_style_name],
+                obstacle_index.query(layout_start, layout_end),
+                play_res_x,
+                play_res_y,
+                preferred_zone=preferred_zone,
+                measurer=text_measurer,
+            )
+            sec_style = _ensure_generated_style(
+                merged,
+                trans_style_name,
+                layout_plan.zone,
+                layout_plan.alignment,
+                layout_plan.transcription_marginv,
+                layout_plan.transcription_fontsize,
+            )
+            romanized_style = None
+            if utterance_romanized:
+                romanized_style = _ensure_generated_style(
+                    merged,
+                    rom_style_name,
+                    layout_plan.zone,
+                    layout_plan.alignment,
+                    layout_plan.romanization_marginv,
+                    layout_plan.romanization_fontsize,
+                )
+        else:
+            sec_style = (
+                secondary_style_map.get(sec_event.style, 'Secondary')
+            )
+            romanized_style = None
+
+        for source_text, t_start, t_end, _ in variants:
             display_text = (
                 html_font_to_ass(source_text, highlight_color)
                 if highlight_current_word
@@ -598,38 +720,25 @@ def merge_subtitles(
             if not display_text.strip() or t_end <= t_start:
                 continue
 
-            n_lines = len(re.findall(r'\\N', best_match.text)) + 1 if best_match else 1
-            sec_style = (
-                "Transcription"
-                if is_transcription
-                else (sec_event.style if sec_event.style in merged.styles else "Secondary")
-            )
-            if best_match:
-                style_suffix = f"{sec_style}_{n_lines}"
-                base_style_name = best_match.style if best_match.style in merged.styles else "Default"
-                adjustment_source = trans_config if is_transcription else {}
-                adjusted_config = calculate_adjusted_style_properties(
-                    merged.styles[base_style_name],
-                    adjustment_source,
-                    style_suffix,
-                    n_lines,
+            if is_transcription:
+                rendered_secondary = pysubs2.SSAEvent(
+                    start=t_start,
+                    end=t_end,
+                    text=display_text,
+                    style=sec_style,
+                    **({'layer': 2} if not disable_layers else {})
                 )
-                sec_style = create_style_if_not_exists(
-                    best_match,
-                    merged,
-                    style_suffix,
-                    adjusted_config,
-                ) or sec_style
+            else:
+                rendered_secondary = sec_event.copy()
+                rendered_secondary.start = t_start
+                rendered_secondary.end = t_end
+                rendered_secondary.text = display_text
+                rendered_secondary.style = sec_style
+                if not disable_layers:
+                    rendered_secondary.layer = 2
+            merged.append(rendered_secondary)
 
-            merged.append(pysubs2.SSAEvent(
-                start=t_start,
-                end=t_end,
-                text=display_text,
-                style=sec_style,
-                **({"layer": 2} if not disable_layers else {})
-            ))
-
-            if need_romanization and converter:
+            if romanized_style and converter:
                 clean_text, tags_info = extract_formatting_tags(source_text)
                 romanized = converter.romanize(clean_text)
                 if not romanized or not romanized.strip():
@@ -638,31 +747,12 @@ def merge_subtitles(
                     reapply_formatting_tags(romanized, tags_info)
                     if highlight_current_word else romanized
                 )
-                romanized_style = "Romanized"
-                if best_match:
-                    trans_lines = len(re.findall(r'\\N', display_text)) + 1
-                    romanized_suffix = f"Romanized_{n_lines}_{trans_lines}"
-                    base_style_name = best_match.style if best_match.style in merged.styles else "Default"
-                    adjusted_rom_config = calculate_adjusted_style_properties(
-                        merged.styles[base_style_name],
-                        rom_config,
-                        romanized_suffix,
-                        n_lines,
-                        trans_config,
-                        trans_lines,
-                    )
-                    romanized_style = create_style_if_not_exists(
-                        best_match,
-                        merged,
-                        romanized_suffix,
-                        adjusted_rom_config,
-                    ) or romanized_style
                 merged.append(pysubs2.SSAEvent(
                     start=t_start,
                     end=t_end,
                     text=romanized_text,
                     style=romanized_style,
-                    **({"layer": 3} if not disable_layers else {})
+                    **({'layer': 3} if not disable_layers else {})
                 ))
 
     # Finalize and save the merged subtitles

@@ -21,7 +21,7 @@ class TranscriptionConfig:
     vad: bool = True
     vad_threshold: float = 0.35
     word_timestamps: bool = True
-    condition_on_previous_text: bool = True
+    condition_on_previous_text: bool = False
     temperature: float = 0.0
 
     def as_cache_dict(self):

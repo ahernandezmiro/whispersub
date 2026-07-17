@@ -10,6 +10,7 @@ WhisperSub is a Python CLI that extracts MKV audio and subtitle tracks, transcri
 - `src/audio.py` owns ffmpeg extraction and optional Demucs vocal separation.
 - `src/transcription.py` owns stable-ts/Faster-Whisper loading, sequential inference, fallback, and structured transcription results.
 - `src/alignment.py` contains pure timing, candidate-discovery, monotonic matching, and snapping logic.
+- `src/layout.py` contains pure event-role classification, text measurement, obstacle geometry, and generated-lane planning.
 - `src/subtitles.py` owns subtitle parsing, normalization, styling, romanization integration, and output rendering.
 - `src/cache.py` owns artifact manifests and atomic output helpers.
 - `src/config.py` contains serializable processing configuration.
@@ -24,6 +25,8 @@ WhisperSub is a Python CLI that extracts MKV audio and subtitle tracks, transcri
 - Write generated artifacts atomically; incomplete subprocess output must never become a valid cache entry.
 - Use milliseconds internally for subtitle timing. Stable-ts JSON word timestamps are converted from seconds at the subtitle boundary.
 - Preserve source signs, titles, and positioned overlays, but do not normally use them as dialogue alignment anchors.
+- Construct generated styles from canonical transcription and romanization defaults. Source cues may influence only an eligible top/bottom lane, never generated colors or style identity.
+- Treat every active source cue as a layout obstacle. Geometry failures and missing fonts must fall back deterministically without dropping generated events.
 - Maintain monotonic alignment and positive cue duration. Low-confidence timing should remain unsnapped.
 - Preserve an explicitly selected Whisper model when retrying on CPU.
 - Do not pass `batch_size` to Stable-ts transcription. It selects Faster-Whisper's VAD-driven batched pipeline, which can omit speech in this workload.
@@ -42,6 +45,12 @@ Run the alignment benchmark:
 
 ```bash
 python scripts/benchmark_alignment.py --events 10000
+```
+
+Run the layout benchmark:
+
+```bash
+python scripts/benchmark_layout.py --events 10000
 ```
 
 Check Python syntax without importing optional ML dependencies:

@@ -147,7 +147,7 @@ python whispersub.py --i examples\deutsch.mkv --merge --base-subs examples\deuts
 
 ## Processing and Cache Behavior
 
-WhisperSub extracts 16 kHz mono PCM audio, matching the speech-recognition input format while keeping temporary files small. Transcription uses Faster-Whisper's sequential pipeline on both CUDA and CPU. Batched inference is intentionally disabled because its VAD-driven pipeline can omit speech in subtitle-focused workloads. If CUDA inference fails, the same resolved model is retried on CPU rather than silently switching models.
+WhisperSub extracts 16 kHz mono PCM audio, matching the speech-recognition input format while keeping temporary files small. Transcription uses Faster-Whisper's sequential pipeline on both CUDA and CPU. Batched inference is intentionally disabled because its VAD-driven pipeline can omit speech in subtitle-focused workloads. Previous-text conditioning is also disabled because a mistaken segment can otherwise poison the decoder context and cause repetition loops across the rest of a recording. If CUDA inference fails, the same resolved model is retried on CPU rather than silently switching models.
 
 Cached artifacts are stored in a path-hashed, source-specific directory under `.tmp`. Audio, vocal stems, extracted subtitles, and transcription results have manifests containing source metadata and the settings that produced them. Changing the source file, track, model, voice-separation setting, backend version, or related processing options invalidates only the affected artifact. Outputs are written atomically, and transcription is cached as stable-ts JSON so subtitle rendering and alignment can be repeated without running speech recognition again.
 
@@ -255,7 +255,11 @@ The subtitle merging process employs a smart positioning algorithm to handle mul
    - Global offset and drift correction are accepted only when supported by enough anchors
    - Many-to-many mappings preserve split or combined subtitle phrasing
    - Word timing is used to split transcription at word boundaries where available
-   - Smart layering helps maintain readability when multiple lines appear simultaneously
+   - Source events and styles are preserved; titles, signs, credits, and positioned graphics never donate generated speech styling
+   - Generated transcription and romanization use canonical styles, so their configured colors, fonts, and sizes remain authoritative
+   - Layout estimates rendered boxes from script resolution, wrapping, font metrics, alignment, margins, and ASS positioning tags
+   - Active source cues are treated as obstacles; transcription and romanization share a stable top or bottom lane and move only when needed
+   - If a font cannot be resolved locally, a conservative built-in text estimator is used and rendering continues
 
 3. Overlap Handling:
    - By default, smart layering is enabled to handle overlapping subtitles
@@ -264,7 +268,7 @@ The subtitle merging process employs a smart positioning algorithm to handle mul
 
 ## Development
 
-The CLI entry point is `whispersub.py`. Processing is divided into focused modules under `src`: extraction and vocal separation in `audio.py`, recognition in `transcription.py`, pure temporal matching in `alignment.py`, rendering in `subtitles.py`, and artifact validation in `cache.py`. ML imports remain lazy so merge-only workflows do not need to initialize PyTorch or stable-ts.
+The CLI entry point is `whispersub.py`. Processing is divided into focused modules under `src`: extraction and vocal separation in `audio.py`, recognition in `transcription.py`, pure temporal matching in `alignment.py`, role classification and geometry planning in `layout.py`, rendering in `subtitles.py`, and artifact validation in `cache.py`. ML imports remain lazy so merge-only workflows do not need to initialize PyTorch or stable-ts.
 
 Run the unit suite after installing the project requirements:
 
@@ -278,7 +282,13 @@ Run the synthetic alignment benchmark independently:
 python scripts/benchmark_alignment.py --events 10000
 ```
 
-See [AGENTS.md](AGENTS.md) for repository conventions and [the implementation design](docs/plans/2026-07-16-performance-alignment-turbo-design.md) for the rationale behind the current architecture.
+Benchmark geometry planning independently:
+
+```bash
+python scripts/benchmark_layout.py --events 10000
+```
+
+See [AGENTS.md](AGENTS.md) for repository conventions, [the performance and alignment design](docs/plans/2026-07-16-performance-alignment-turbo-design.md), and [the dialogue styling and layout design](docs/plans/2026-07-17-rendering-layout-design.md) for the rationale behind the current architecture.
 
 ## License
 

@@ -2,7 +2,7 @@
 
 ## Status
 
-Planned. This document defines the next rendering iteration; it does not add or remove user-facing features.
+Implemented. The rendering iteration is covered by focused layout and subtitle integration tests and does not add or remove CLI features.
 
 ## Objective
 

@@ -61,6 +61,22 @@ class TranscriptionTests(unittest.TestCase):
 
             self.assertNotIn("batch_size", model.calls[0])
 
+    def test_transcription_disables_previous_text_conditioning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths = self._paths(directory)
+            model = _FakeModel()
+            stable = types.SimpleNamespace(load_faster_whisper=lambda *args, **kwargs: model)
+            with patch.dict(sys.modules, {"stable_whisper": stable}), \
+                 patch("src.transcription.get_optimal_device_and_model", return_value=("cuda", "large-v3")), \
+                 patch("src.transcription._package_version", return_value="test"):
+                transcribe_with_whisper(*paths[:3], result_json_path=paths[3])
+
+            self.assertIs(model.calls[0]["condition_on_previous_text"], False)
+            self.assertIs(
+                read_manifest(paths[3])["config"]["condition_on_previous_text"],
+                False,
+            )
+
     def test_batched_transcription_cache_is_invalidated(self):
         with tempfile.TemporaryDirectory() as directory:
             paths = self._paths(directory)

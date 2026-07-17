@@ -19,6 +19,7 @@ class AlignmentEvent:
     style: str = ""
     alignment: int = 2
     positioned: bool = False
+    role: str = 'unknown'
     words: tuple = field(default_factory=tuple)
 
     @property
