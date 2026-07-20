@@ -18,6 +18,8 @@ _MOVE_TAG = re.compile(
     r"\s*([-+\d.]+)\s*,\s*([-+\d.]+)"
 )
 _DRAWING_TAG = re.compile(r"\\p[1-9]\d*")
+_DETERMINISTIC_LINE_HEIGHT = 1.0
+_GENERATED_TRACK_GAP = 0
 
 
 class EventRole(str, Enum):
@@ -181,7 +183,7 @@ class FallbackTextMeasurer:
             rendered_width = max(rendered_width, min(max_width, line_width))
         outline = max(0.0, _style_number(style, "outline", 1))
         shadow = max(0.0, _style_number(style, "shadow", 1))
-        line_height = font_size * scale_y * 1.28
+        line_height = font_size * scale_y * _DETERMINISTIC_LINE_HEIGHT
         padding = 2 * outline + shadow
         return TextExtent(
             min(max_width, rendered_width + padding),
@@ -340,7 +342,7 @@ def _anchored_rect(x, y, extent, alignment):
 
 def estimate_event_box(event, play_res_x, play_res_y, measurer=None):
     """Estimate a conservative screen-space box for a source ASS event."""
-    measurer = measurer or FontAwareTextMeasurer()
+    measurer = measurer or FallbackTextMeasurer()
     style = event.style
     marginl = event.marginl or int(_style_number(style, "marginl", 10))
     marginr = event.marginr or int(_style_number(style, "marginr", 10))
@@ -377,7 +379,7 @@ class ObstacleIndex:
     """Interval index with cached geometry for source events."""
 
     def __init__(self, events, play_res_x, play_res_y, measurer=None):
-        measurer = measurer or FontAwareTextMeasurer()
+        measurer = measurer or FallbackTextMeasurer()
         entries = sorted(
             ((event.start, event.end, estimate_event_box(
                 event, play_res_x, play_res_y, measurer
@@ -427,7 +429,7 @@ def plan_generated_layout(
     measurer=None,
 ):
     """Choose a stable top/bottom lane and return serialization-ready properties."""
-    measurer = measurer or FontAwareTextMeasurer()
+    measurer = measurer or FallbackTextMeasurer()
     safe_x = min(
         max(12, round(play_res_x * 0.035)),
         max(0, play_res_x // 2 - 1),
@@ -436,7 +438,7 @@ def plan_generated_layout(
         max(12, round(play_res_y * 0.035)),
         max(0, play_res_y // 2 - 1),
     )
-    padding = max(6, round(play_res_y * 0.012)) if romanization_text else 0
+    padding = _GENERATED_TRACK_GAP if romanization_text else 0
     available_width = max(1, play_res_x - 2 * safe_x)
     available_height = max(1, play_res_y - 2 * safe_y)
     fallback_measurer = FallbackTextMeasurer()

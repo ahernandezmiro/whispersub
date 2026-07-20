@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -5,6 +6,50 @@ import tempfile
 
 from .cache import atomic_output_path, build_manifest, cache_is_valid, write_manifest
 from .config import AudioExtractionConfig
+
+
+def get_audio_track_language(input_mkv, audio_track_index):
+    """Return the selected MKV stream's language tag, when available."""
+    command = [
+        "ffprobe",
+        "-v", "error",
+        "-show_entries", "stream=index,codec_type:stream_tags=language",
+        "-of", "json",
+        input_mkv,
+    ]
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        streams = json.loads(completed.stdout).get("streams", [])
+    except (OSError, subprocess.CalledProcessError, json.JSONDecodeError) as error:
+        print(f"[WARNING] Could not read audio language metadata: {error}")
+        return None
+
+    for stream in streams:
+        if stream.get("codec_type") != "audio":
+            continue
+        try:
+            stream_index = int(stream.get("index"))
+        except (TypeError, ValueError):
+            continue
+        if stream_index != audio_track_index:
+            continue
+
+        language = (stream.get("tags") or {}).get("language")
+        if not language or language.lower() in {"und", "zxx"}:
+            return None
+        print(
+            f"[INFO] Audio track {audio_track_index} language metadata: "
+            f"{language}"
+        )
+        return language
+
+    return None
+
 
 def extract_audio(input_mkv, output_wav, audio_track_index=0, sample_rate=16000, channels=1):
     """

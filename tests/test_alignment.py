@@ -2,12 +2,14 @@ import unittest
 
 from src.alignment import (
     AlignmentEvent,
+    SnapProposal,
     TimeTransform,
     WordTiming,
     align_events,
     dialogue_anchor_confidence,
     discover_candidates,
     estimate_time_transform,
+    resolve_snapped_spans,
     split_words_across_bases,
 )
 
@@ -120,6 +122,32 @@ class AlignmentTests(unittest.TestCase):
         secondary = [AlignmentEvent(0, 2000, 0, text="one two")]
         match = align_events(base, secondary, tolerance=200)[0]
         self.assertEqual(match.bases, (0, 2))
+
+    def test_ordered_snap_resolver_rejects_only_conflicting_boundaries(self):
+        spans = [(1000, 1100), (1100, 1200)]
+        proposals = [
+            SnapProposal(start=950, end=1250),
+            SnapProposal(start=950, end=1250),
+        ]
+        self.assertEqual(
+            resolve_snapped_spans(spans, proposals),
+            [(950, 1100), (1100, 1250)],
+        )
+
+    def test_ordered_snap_resolver_preserves_existing_source_overlap(self):
+        spans = [(1000, 1200), (1100, 1300)]
+        self.assertEqual(
+            resolve_snapped_spans(spans, [SnapProposal(), SnapProposal()]),
+            spans,
+        )
+
+    def test_ordered_snap_resolver_keeps_every_span_positive(self):
+        spans = [(1000, 1001), (1001, 1002)]
+        proposals = [
+            SnapProposal(end=1000),
+            SnapProposal(start=1002),
+        ]
+        self.assertEqual(resolve_snapped_spans(spans, proposals), spans)
 
 
 if __name__ == "__main__":

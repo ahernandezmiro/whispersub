@@ -6,10 +6,54 @@ from unittest.mock import patch
 
 import pysubs2
 
-from src.subtitles import extract_subtitles, merge_subtitles
+from src.subtitles import extract_subtitles, merge_subtitles, try_load_subtitles
 
 
 class SubtitleIntegrationTests(unittest.TestCase):
+    def test_crlf_srt_loads_like_lf_without_phantom_line_breaks(self):
+        lf_content = (
+            "1\n00:00:00,000 --> 00:00:01,000\nFirst line\n\n"
+            "2\n00:00:01,000 --> 00:00:02,000\nSecond line\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            lf_path = os.path.join(directory, 'lf.srt')
+            crlf_path = os.path.join(directory, 'crlf.srt')
+            with open(lf_path, 'wb') as handle:
+                handle.write(lf_content.encode('utf-8'))
+            with open(crlf_path, 'wb') as handle:
+                handle.write(lf_content.replace('\n', '\r\n').encode('utf-8'))
+
+            lf_events = try_load_subtitles(lf_path)
+            crlf_events = try_load_subtitles(crlf_path)
+
+        self.assertEqual(
+            [event.text for event in crlf_events],
+            [event.text for event in lf_events],
+        )
+        self.assertTrue(
+            all(not event.text.endswith(r'\N') for event in crlf_events)
+        )
+
+    def test_authored_ass_line_break_survives_content_detection(self):
+        content = """[Script Info]
+ScriptType: v4.00+
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,20,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,1,0,2,10,10,10,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Dialogue: 0,0:00:00.00,0:00:01.00,Default,,0,0,0,,one\\Ntwo
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, 'ass-content.srt')
+            with open(path, 'wb') as handle:
+                handle.write(content.encode('utf-8'))
+            loaded = try_load_subtitles(path)
+
+        self.assertEqual([event.text for event in loaded], [r'one\Ntwo'])
+
     def test_transcription_only_word_level_render_needs_no_base_track(self):
         with tempfile.TemporaryDirectory() as directory:
             transcription_path = os.path.join(directory, "transcription.srt")
@@ -319,6 +363,128 @@ class SubtitleIntegrationTests(unittest.TestCase):
                         int(merged.styles[event.style].alignment),
                         expected_alignment,
                     )
+
+    def test_word_level_utterance_snaps_only_its_outer_boundaries(self):
+        class Converter:
+            def romanize(self, text):
+                return f'rom {text}'
+
+        with tempfile.TemporaryDirectory() as directory:
+            base_path = os.path.join(directory, 'base.srt')
+            transcription_path = os.path.join(directory, 'word-level.srt')
+            output_path = os.path.join(directory, 'merged.ass')
+            with open(base_path, 'w', encoding='utf-8', newline='\n') as handle:
+                handle.write(
+                    '1\n00:02:18,130 --> 00:02:18,440\ntranslation\n'
+                )
+            with open(
+                transcription_path, 'w', encoding='utf-8', newline='\n'
+            ) as handle:
+                handle.write(
+                    '1\n00:02:18,260 --> 00:02:18,272\n'
+                    '<font color="#00FF00">Go</font> now\n\n'
+                    '2\n00:02:18,272 --> 00:02:18,440\n'
+                    'Go <font color="#00FF00">now</font>\n'
+                )
+
+            with patch(
+                'src.subtitles.romanization_converter',
+                return_value=Converter(),
+            ):
+                merge_subtitles(
+                    base_subs_path=base_path,
+                    second_subs_path=None,
+                    transcribed_subs_path=transcription_path,
+                    output_subs_path=output_path,
+                    detected_language='ja',
+                    need_romanization=True,
+                    highlight_current_word=True,
+                )
+
+            merged = pysubs2.load(output_path)
+            frames = [event for event in merged if event.layer == 2]
+            romanized = [event for event in merged if event.layer == 3]
+
+        self.assertEqual(len(frames), 2)
+        self.assertEqual(len(romanized), 2)
+        self.assertEqual(
+            [(event.start, event.end) for event in frames],
+            [(138130, 138270), (138270, 138440)],
+        )
+        self.assertEqual(
+            [(event.start, event.end) for event in romanized],
+            [(event.start, event.end) for event in frames],
+        )
+        self.assertTrue(all(event.end > event.start for event in frames))
+        self.assertEqual(len({event.style for event in frames}), 1)
+        self.assertEqual(len({event.style for event in romanized}), 1)
+
+    def test_word_level_snap_cannot_erase_a_short_outer_frame(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_path = os.path.join(directory, 'base.srt')
+            transcription_path = os.path.join(directory, 'word-level.srt')
+            output_path = os.path.join(directory, 'merged.ass')
+            with open(base_path, 'w', encoding='utf-8', newline='\n') as handle:
+                handle.write(
+                    '1\n00:00:00,000 --> 00:00:00,090\ntranslation\n'
+                )
+            with open(
+                transcription_path, 'w', encoding='utf-8', newline='\n'
+            ) as handle:
+                handle.write(
+                    '1\n00:00:00,000 --> 00:00:00,100\n'
+                    '<font color="#00FF00">first</font> second\n\n'
+                    '2\n00:00:00,100 --> 00:00:00,200\n'
+                    'first <font color="#00FF00">second</font>\n'
+                )
+
+            merge_subtitles(
+                base_subs_path=base_path,
+                second_subs_path=None,
+                transcribed_subs_path=transcription_path,
+                output_subs_path=output_path,
+                detected_language='en',
+                highlight_current_word=True,
+            )
+            merged = pysubs2.load(output_path)
+            frames = [event for event in merged if event.layer == 2]
+
+        self.assertEqual(
+            [(event.start, event.end) for event in frames],
+            [(0, 100), (100, 200)],
+        )
+        self.assertTrue(all(event.end > event.start for event in frames))
+
+    def test_non_word_level_adjacent_cues_do_not_gain_overlap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base_path = os.path.join(directory, 'base.srt')
+            transcription_path = os.path.join(directory, 'transcription.srt')
+            output_path = os.path.join(directory, 'merged.ass')
+            with open(base_path, 'w', encoding='utf-8', newline='\n') as handle:
+                handle.write(
+                    '1\n00:00:00,950 --> 00:00:01,250\ntranslation\n'
+                )
+            with open(
+                transcription_path, 'w', encoding='utf-8', newline='\n'
+            ) as handle:
+                handle.write(
+                    '1\n00:00:01,000 --> 00:00:01,100\nfirst\n\n'
+                    '2\n00:00:01,100 --> 00:00:01,200\nsecond\n'
+                )
+
+            merge_subtitles(
+                base_subs_path=base_path,
+                second_subs_path=None,
+                transcribed_subs_path=transcription_path,
+                output_subs_path=output_path,
+                detected_language='en',
+            )
+            merged = pysubs2.load(output_path)
+            events = [event for event in merged if event.layer == 2]
+
+        self.assertEqual(len(events), 2)
+        self.assertLessEqual(events[0].end, events[1].start)
+        self.assertTrue(all(event.end > event.start for event in events))
 
 
 if __name__ == "__main__":

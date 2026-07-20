@@ -6,7 +6,7 @@ import shutil
 import sys
 import re
 
-from src.audio import extract_audio
+from src.audio import extract_audio, get_audio_track_language
 from src.transcription import transcribe_with_whisper
 from src.subtitles import extract_subtitles, merge_subtitles
 from src.utils import clear_cache_for_file, file_exists, temp_dir
@@ -134,6 +134,8 @@ def main():
                         help="Index of the audio track to extract (default=1).")
     transcription_group.add_argument("--whisper-model", type=str,
                         help="Whisper model name or compatible Faster-Whisper model path (built-ins: tiny, base, small, medium, large, large-v2, large-v3, turbo).")
+    transcription_group.add_argument("--language", type=str,
+                        help="Whisper language code override (for example: ja, en, ko). Skips automatic language detection.")
     transcription_group.add_argument("--force-cpu",
                         help="Force CPU usage for transcription.", action="store_true")    
     transcription_group.add_argument("--romanize", action="store_true",
@@ -224,6 +226,10 @@ def main():
     if args.transcribe:
         raw_audio_path = os.path.join(file_tmp_dir, f'{args.audio_track}_extracted.wav')
         extract_audio(file_input_path, raw_audio_path, audio_track_index=args.audio_track)
+        metadata_language = None
+        if not args.language:
+            metadata_language = get_audio_track_language(
+                file_input_path, args.audio_track)
         
         input_for_whisper = raw_audio_path
         
@@ -237,9 +243,11 @@ def main():
             model_name=args.whisper_model,
             voice_separation=args.voice_separation,
             force_cpu=args.force_cpu,
+            language=args.language,
+            metadata_language=metadata_language,
             result_json_path=transcription_result_path,
         )
-    
+
     base_subs_path = None
     second_subs_path = None
 

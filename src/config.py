@@ -17,6 +17,8 @@ class TranscriptionConfig:
     model_name: str
     device: str
     compute_type: str
+    requested_language: str = None
+    metadata_language: str = None
     voice_separation: bool = False
     vad: bool = True
     vad_threshold: float = 0.35

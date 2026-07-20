@@ -57,6 +57,12 @@ class EventMatch:
     transform: TimeTransform
 
 
+@dataclass(frozen=True)
+class SnapProposal:
+    start: int = None
+    end: int = None
+
+
 def dialogue_anchor_confidence(event):
     """Estimate whether a base event represents spoken dialogue."""
     if not event.text.strip() or event.positioned:
@@ -307,19 +313,83 @@ def _candidate_evidence(candidates):
     return len(best_by_secondary), sum(best_by_secondary.values())
 
 
-def snap_times(secondary, match, base_events, tolerance=200, minimum_duration=100):
+def propose_snap_times(secondary, match, base_events, tolerance=200):
+    """Return independently eligible outer-boundary snaps for an event."""
     if not match or match.confidence < 0.5:
-        return secondary.start, secondary.end
+        return SnapProposal()
     mapped = [base_events[position] for position in match.bases]
     target_start = min(event.start for event in mapped)
     target_end = max(event.end for event in mapped)
     corrected_start = match.transform.apply(secondary.start)
     corrected_end = match.transform.apply(secondary.end)
-    start = target_start if abs(corrected_start - target_start) <= tolerance else secondary.start
-    end = target_end if abs(corrected_end - target_end) <= tolerance else secondary.end
-    if end - start < minimum_duration:
-        return secondary.start, secondary.end
-    return round(start), round(end)
+    return SnapProposal(
+        start=(
+            round(target_start)
+            if abs(corrected_start - target_start) <= tolerance else None
+        ),
+        end=(
+            round(target_end)
+            if abs(corrected_end - target_end) <= tolerance else None
+        ),
+    )
+
+
+def _overlap_duration(left, right):
+    return max(0, min(left[1], right[1]) - max(left[0], right[0]))
+
+
+def resolve_snapped_spans(spans, proposals, minimum_duration=1):
+    """Accept boundary snaps without increasing overlap between source neighbors.
+
+    Each boundary is considered independently. Rejected boundaries retain their
+    source value, so genuine source overlap and very short positive events are not
+    flattened or discarded.
+    """
+    if len(spans) != len(proposals):
+        raise ValueError("spans and proposals must have the same length")
+
+    originals = [(round(start), round(end)) for start, end in spans]
+    resolved = list(originals)
+    minimum_duration = max(1, round(minimum_duration))
+
+    def can_accept(position, candidate):
+        if candidate[1] - candidate[0] < minimum_duration:
+            return False
+        if position:
+            permitted = _overlap_duration(
+                originals[position - 1], originals[position]
+            )
+            if _overlap_duration(resolved[position - 1], candidate) > permitted:
+                return False
+        if position + 1 < len(resolved):
+            permitted = _overlap_duration(
+                originals[position], originals[position + 1]
+            )
+            if _overlap_duration(candidate, resolved[position + 1]) > permitted:
+                return False
+        return True
+
+    for position, proposal in enumerate(proposals):
+        if proposal.start is not None:
+            candidate = (round(proposal.start), resolved[position][1])
+            if can_accept(position, candidate):
+                resolved[position] = candidate
+        if proposal.end is not None:
+            candidate = (resolved[position][0], round(proposal.end))
+            if can_accept(position, candidate):
+                resolved[position] = candidate
+
+    return resolved
+
+
+def snap_times(secondary, match, base_events, tolerance=200, minimum_duration=100):
+    """Compatibility wrapper for resolving a single event in isolation."""
+    proposal = propose_snap_times(secondary, match, base_events, tolerance)
+    return resolve_snapped_spans(
+        [(secondary.start, secondary.end)],
+        [proposal],
+        minimum_duration=minimum_duration,
+    )[0]
 
 
 def split_words_across_bases(words, match, base_events):

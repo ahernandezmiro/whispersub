@@ -3,19 +3,22 @@ import re
 import json
 import os
 from bisect import bisect_left, bisect_right
+from dataclasses import dataclass
 import pysubs2
 
 from .alignment import (
     AlignmentEvent,
+    SnapProposal,
     WordTiming,
     align_events,
-    snap_times,
+    propose_snap_times,
+    resolve_snapped_spans,
     split_words_across_bases,
 )
 from .cache import atomic_output_path, build_manifest, cache_is_valid, write_manifest
 from .layout import (
     EventRole,
-    FontAwareTextMeasurer,
+    FallbackTextMeasurer,
     LayoutEvent,
     ObstacleIndex,
     classify_event_role,
@@ -354,6 +357,11 @@ def initialize_default_styles(merged, style_config=None):
 
     return trans_style_name, rom_style_name
 
+
+def _normalize_newlines(content):
+    return content.replace('\r\n', '\n').replace('\r', '\n')
+
+
 def try_load_subtitles(file_path):
     if not file_path:
         return []
@@ -374,6 +382,7 @@ def try_load_subtitles(file_path):
     for encoding in dict.fromkeys(encodings):
         try:
             content = raw_data.decode(encoding, errors='strict')
+            content = _normalize_newlines(content)
             try:
                 return pysubs2.SSAFile.from_string(content, keep_html_tags=True)
             except pysubs2.exceptions.FormatError as error:
@@ -482,35 +491,108 @@ def _layout_anchor(match, normalized_base):
     return match.primary if match.primary in eligible else eligible[0]
 
 
-def _normalize_secondary_events(second_subs, words=None):
+@dataclass(frozen=True)
+class _RenderGroup:
+    text: str
+    members: tuple
+
+    @property
+    def start(self):
+        return self.members[0].start
+
+    @property
+    def end(self):
+        return self.members[-1].end
+
+
+def _group_secondary_events(second_subs, group_highlight_frames, max_gap=1000):
+    groups = []
+    for event in second_subs:
+        if not event.text.strip():
+            continue
+        clean_text = extract_formatting_tags(event.text)[0]
+        if (
+            group_highlight_frames
+            and groups
+            and groups[-1].text == clean_text
+            and event.start - groups[-1].end <= max_gap
+        ):
+            previous = groups[-1]
+            groups[-1] = _RenderGroup(
+                text=previous.text,
+                members=previous.members + (event,),
+            )
+        else:
+            groups.append(_RenderGroup(clean_text, (event,)))
+    return groups
+
+
+def _normalize_secondary_events(groups, words=None):
     words = sorted(words or [], key=lambda word: word.start)
     word_starts = [word.start for word in words]
     word_ends = [word.end for word in words]
     normalized = []
-    for index, event in enumerate(second_subs):
-        first_word = bisect_right(word_ends, event.start)
-        last_word = bisect_left(word_starts, event.end)
+    for index, group in enumerate(groups):
+        first_word = bisect_right(word_ends, group.start)
+        last_word = bisect_left(word_starts, group.end)
         normalized.append(AlignmentEvent(
-            start=event.start,
-            end=event.end,
+            start=group.start,
+            end=group.end,
             index=index,
-            text=extract_formatting_tags(event.text)[0],
-            style=event.style,
+            text=group.text,
+            style=group.members[0].style,
             words=tuple(words[first_word:last_word]),
         ))
     return normalized
 
 
-def _snap_word_group(words, base_event, match, tolerance):
-    start = words[0].start
-    end = words[-1].end
-    corrected_start = match.transform.apply(start)
-    corrected_end = match.transform.apply(end)
-    if match.confidence >= 0.5 and abs(corrected_start - base_event.start) <= tolerance:
-        start = base_event.start
-    if match.confidence >= 0.5 and abs(corrected_end - base_event.end) <= tolerance:
-        end = base_event.end
-    return (start, end) if end > start else (words[0].start, words[-1].end)
+def _render_group_variants(
+    group,
+    normalized_event,
+    match,
+    normalized_base,
+    resolved_span,
+):
+    variants = []
+    word_groups = split_words_across_bases(
+        normalized_event.words,
+        match,
+        normalized_base,
+    )
+    if word_groups:
+        for base_position, words in word_groups:
+            piece_text = "".join(word.text for word in words).strip()
+            if piece_text:
+                variants.append([
+                    piece_text, words[0].start, words[-1].end, base_position
+                ])
+    else:
+        base_position = match.primary if match else None
+        for member in group.members:
+            variants.append([
+                member.text, member.start, member.end, base_position
+            ])
+
+    if variants:
+        variants[0][1] = resolved_span[0]
+        variants[-1][2] = resolved_span[1]
+    return [tuple(variant) for variant in variants]
+
+
+def _constrain_group_proposal(group, normalized_event, proposal):
+    """Reject outer snaps that would erase the first or last rendered member."""
+    first_end = group.members[0].end
+    last_start = group.members[-1].start
+    if len(group.members) == 1 and normalized_event.words:
+        first_end = normalized_event.words[0].end
+        last_start = normalized_event.words[-1].start
+    start = proposal.start
+    end = proposal.end
+    if start is not None and start >= first_end:
+        start = None
+    if end is not None and end <= last_start:
+        end = None
+    return SnapProposal(start=start, end=end)
 
 
 def merge_subtitles(
@@ -601,66 +683,72 @@ def merge_subtitles(
         load_transcription_words(transcription_result_path)
         if is_transcription and not highlight_current_word else []
     )
+    render_groups = _group_secondary_events(
+        second_subs,
+        group_highlight_frames=is_transcription and highlight_current_word,
+    )
     normalized_base = _normalize_base_events(subs_base, merged)
-    normalized_secondary = _normalize_secondary_events(second_subs, transcription_words)
+    normalized_secondary = _normalize_secondary_events(
+        render_groups, transcription_words
+    )
     matches = align_events(normalized_base, normalized_secondary, sync_tolerance)
+    proposals = [
+        _constrain_group_proposal(
+            render_groups[position],
+            event,
+            propose_snap_times(
+                event,
+                matches.get(position),
+                normalized_base,
+                sync_tolerance,
+            ),
+        )
+        for position, event in enumerate(normalized_secondary)
+    ]
+    resolved_spans = resolve_snapped_spans(
+        [(event.start, event.end) for event in normalized_secondary],
+        proposals,
+    )
+
     play_res_x = play_res_y = None
     text_measurer = obstacle_index = None
     if is_transcription:
         play_res_x, play_res_y = _script_resolution(merged)
-        text_measurer = FontAwareTextMeasurer()
+        text_measurer = FallbackTextMeasurer()
         obstacle_index = ObstacleIndex(
             _layout_events(subs_base, merged, normalized_base),
             play_res_x,
             play_res_y,
             text_measurer,
         )
+    else:
+        for event in second_subs:
+            if event.text.strip():
+                continue
+            rendered_secondary = event.copy()
+            rendered_secondary.style = secondary_style_map.get(
+                event.style, 'Secondary'
+            )
+            if not disable_layers:
+                rendered_secondary.layer = 2
+            merged.append(rendered_secondary)
 
-    # Process secondary events using monotonic, many-to-many alignment.
-    for position, sec_event in enumerate(second_subs):
-        if not sec_event.text.strip():
-            if not is_transcription:
-                rendered_secondary = sec_event.copy()
-                rendered_secondary.style = secondary_style_map.get(
-                    sec_event.style, 'Secondary'
-                )
-                if not disable_layers:
-                    rendered_secondary.layer = 2
-                merged.append(rendered_secondary)
-            continue
-
+    # Process ordered utterance groups using their resolved outer envelopes.
+    for position, group in enumerate(render_groups):
         normalized_event = normalized_secondary[position]
         match = matches.get(position)
-        variants = []
-        word_groups = split_words_across_bases(
-            normalized_event.words,
+        variants = _render_group_variants(
+            group,
+            normalized_event,
             match,
             normalized_base,
+            resolved_spans[position],
         )
-        if word_groups:
-            for base_position, words in word_groups:
-                piece_text = "".join(word.text for word in words).strip()
-                if not piece_text:
-                    continue
-                start, end = _snap_word_group(
-                    words,
-                    normalized_base[base_position],
-                    match,
-                    sync_tolerance,
-                )
-                variants.append((piece_text, start, end, base_position))
-        else:
-            start, end = snap_times(
-                normalized_event,
-                match,
-                normalized_base,
-                sync_tolerance,
-            )
-            base_position = match.primary if match else None
-            variants.append((sec_event.text, start, end, base_position))
+        if not variants:
+            continue
 
         if is_transcription:
-            utterance_text = extract_formatting_tags(sec_event.text)[0]
+            utterance_text = group.text
             utterance_romanized = None
             if need_romanization and converter:
                 utterance_romanized = converter.romanize(utterance_text)
@@ -674,8 +762,7 @@ def merge_subtitles(
                 and normalized_base[anchor_position].alignment in (7, 8, 9)
             ):
                 preferred_zone = 'top'
-            layout_start = min(variant[1] for variant in variants)
-            layout_end = max(variant[2] for variant in variants)
+            layout_start, layout_end = resolved_spans[position]
             layout_plan = plan_generated_layout(
                 utterance_text,
                 merged.styles[trans_style_name],
@@ -706,8 +793,9 @@ def merge_subtitles(
                     layout_plan.romanization_fontsize,
                 )
         else:
-            sec_style = (
-                secondary_style_map.get(sec_event.style, 'Secondary')
+            source_event = group.members[0]
+            sec_style = secondary_style_map.get(
+                source_event.style, 'Secondary'
             )
             romanized_style = None
 
@@ -729,7 +817,7 @@ def merge_subtitles(
                     **({'layer': 2} if not disable_layers else {})
                 )
             else:
-                rendered_secondary = sec_event.copy()
+                rendered_secondary = source_event.copy()
                 rendered_secondary.start = t_start
                 rendered_secondary.end = t_end
                 rendered_secondary.text = display_text

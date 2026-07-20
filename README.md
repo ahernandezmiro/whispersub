@@ -97,6 +97,7 @@ python whispersub.py --i <input.mkv> [--o <output.ass>] [--transcribe] [--merge]
 
 * `--audio-track` : Index of the audio track to extract (default: 1)
 * `--whisper-model` : Whisper model name or compatible Faster-Whisper model path. Built-ins are tiny, base, small, medium, large, large-v2, large-v3, and turbo. If not specified, the model is automatically selected based on your system's capabilities and available memory. Turbo offers substantially faster transcription with a small accuracy tradeoff.
+* `--language` : Override automatic detection with a Whisper language code such as `ja`, `en`, or `ko`
 * `--force-cpu` : Force CPU usage for transcription even if CUDA is available. Useful for debugging or when GPU memory is limited
 * `--romanize` : Enable romanization for supported languages
 * `--word-level` : Enable word-level timestamps in transcription
@@ -147,9 +148,9 @@ python whispersub.py --i examples\deutsch.mkv --merge --base-subs examples\deuts
 
 ## Processing and Cache Behavior
 
-WhisperSub extracts 16 kHz mono PCM audio, matching the speech-recognition input format while keeping temporary files small. Transcription uses Faster-Whisper's sequential pipeline on both CUDA and CPU. Batched inference is intentionally disabled because its VAD-driven pipeline can omit speech in subtitle-focused workloads. Previous-text conditioning is also disabled because a mistaken segment can otherwise poison the decoder context and cause repetition loops across the rest of a recording. If CUDA inference fails, the same resolved model is retried on CPU rather than silently switching models.
+WhisperSub extracts 16 kHz mono PCM audio, matching the speech-recognition input format while keeping temporary files small. Unless `--language` is supplied, language selection evaluates three 30-second windows distributed across the recording. The selected MKV audio track's language tag is used when its mean model confidence reaches 60%; otherwise, a confidence-weighted vote across the three windows selects the language. Transcription then passes that language explicitly to Faster-Whisper's sequential pipeline on both CUDA and CPU. Batched inference is intentionally disabled because its VAD-driven pipeline can omit speech in subtitle-focused workloads. Previous-text conditioning is also disabled because a mistaken segment can otherwise poison the decoder context and cause repetition loops across the rest of a recording. If CUDA inference fails, the same resolved model is retried on CPU rather than silently switching models.
 
-Cached artifacts are stored in a path-hashed, source-specific directory under `.tmp`. Audio, vocal stems, extracted subtitles, and transcription results have manifests containing source metadata and the settings that produced them. Changing the source file, track, model, voice-separation setting, backend version, or related processing options invalidates only the affected artifact. Outputs are written atomically, and transcription is cached as stable-ts JSON so subtitle rendering and alignment can be repeated without running speech recognition again.
+Cached artifacts are stored in a path-hashed, source-specific directory under `.tmp`. Audio, vocal stems, extracted subtitles, and transcription results have manifests containing source metadata and the settings that produced them. Changing the source file, track, model, language override, language metadata hint, detection strategy, voice-separation setting, backend version, or related processing options invalidates only the affected artifact. Outputs are written atomically, and transcription is cached as stable-ts JSON so subtitle rendering and alignment can be repeated without running speech recognition again.
 
 Subtitle matching uses dialogue-anchor filtering and monotonic temporal alignment. The matcher estimates global offset and small clock drift only when the evidence improves coverage, then supports one-to-one, one-to-many, and many-to-one cue mappings. Positioned signs and titles remain in the output but are not normally used as spoken-dialogue anchors. When word timestamps are available, a transcription segment spanning multiple base cues is split at word boundaries.
 
@@ -255,11 +256,13 @@ The subtitle merging process employs a smart positioning algorithm to handle mul
    - Global offset and drift correction are accepted only when supported by enough anchors
    - Many-to-many mappings preserve split or combined subtitle phrasing
    - Word timing is used to split transcription at word boundaries where available
+   - In word-level mode, alignment and snapping operate on whole utterances; only the first and last highlight-frame boundaries can move, so internal Whisper word timing remains authoritative
+   - Snapped boundaries are resolved as an ordered sequence and cannot introduce more overlap than the source cues already contained
    - Source events and styles are preserved; titles, signs, credits, and positioned graphics never donate generated speech styling
    - Generated transcription and romanization use canonical styles, so their configured colors, fonts, and sizes remain authoritative
-   - Layout estimates rendered boxes from script resolution, wrapping, font metrics, alignment, margins, and ASS positioning tags
-   - Active source cues are treated as obstacles; transcription and romanization share a stable top or bottom lane and move only when needed
-   - If a font cannot be resolved locally, a conservative built-in text estimator is used and rendering continues
+   - Runtime layout uses a deterministic built-in text estimator, so optional Pillow packages and locally installed fonts do not change serialized styles or margins
+   - Active source cues are treated as obstacles; transcription and romanization form one compact stack in a stable top or bottom lane and move only when needed
+   - ASS positions and margins scale from `PlayResX`/`PlayResY`; exact glyph shapes, wrapping, and aspect-ratio behavior can still vary with the player, renderer, and available playback fonts
 
 3. Overlap Handling:
    - By default, smart layering is enabled to handle overlapping subtitles
@@ -286,6 +289,13 @@ Benchmark geometry planning independently:
 
 ```bash
 python scripts/benchmark_layout.py --events 10000
+```
+
+For optional visual QA, render selected ASS frames through ffmpeg/libass. This
+developer helper is not used by the application or unit suite:
+
+```bash
+python scripts/render_subtitle_fixture.py output.ass --timestamp 138.3 --output-dir .tmp/render-fixture
 ```
 
 See [AGENTS.md](AGENTS.md) for repository conventions, [the performance and alignment design](docs/plans/2026-07-16-performance-alignment-turbo-design.md), and [the dialogue styling and layout design](docs/plans/2026-07-17-rendering-layout-design.md) for the rationale behind the current architecture.

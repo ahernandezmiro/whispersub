@@ -1,12 +1,50 @@
+import json
 import os
+import subprocess
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from src.audio import extract_audio, separate_vocals
+from src.audio import extract_audio, get_audio_track_language, separate_vocals
 
 
 class AudioExtractionTests(unittest.TestCase):
+    def test_reads_language_from_selected_audio_stream(self):
+        probe_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({
+                "streams": [
+                    {"index": 0, "codec_type": "video", "tags": {}},
+                    {
+                        "index": 1,
+                        "codec_type": "audio",
+                        "tags": {"language": "jpn"},
+                    },
+                ],
+            }),
+            stderr="",
+        )
+
+        with patch("src.audio.subprocess.run", return_value=probe_result) as run:
+            language = get_audio_track_language("video.mkv", audio_track_index=1)
+
+        self.assertEqual(language, "jpn")
+        self.assertIn("ffprobe", run.call_args.args[0][0])
+
+    def test_missing_audio_language_metadata_is_nonfatal(self):
+        probe_result = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout='{"streams": [{"index": 1, "codec_type": "audio"}]}',
+            stderr="",
+        )
+
+        with patch("src.audio.subprocess.run", return_value=probe_result):
+            self.assertIsNone(
+                get_audio_track_language("video.mkv", audio_track_index=1)
+            )
+
     def test_extracts_16khz_mono_and_writes_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
             source = os.path.join(directory, "video.mkv")
